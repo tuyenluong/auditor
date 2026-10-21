@@ -10,7 +10,8 @@
     "typecheck": "npm run typecheck -w @tuyenluong/auditor",
     "test": "npm run test -w @tuyenluong/auditor",
     "build": "npm run build -w @tuyenluong/auditor",
-    "prepare": "git config core.hooksPath .githooks || true"
+    "prepare": "git config core.hooksPath .githooks || true",
+    "lint:pr-title": "node scripts/lint-pr-title.mjs"
   },
   "devDependencies": {
     "@commitlint/cli": "^21.2.4",
