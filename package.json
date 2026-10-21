@@ -1,0 +1,14 @@
+{
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "typecheck": "npm run typecheck -w @tuyenluong/auditor",
+    "test": "npm run test -w @tuyenluong/auditor",
+    "build": "npm run build -w @tuyenluong/auditor"
+  }
+}
