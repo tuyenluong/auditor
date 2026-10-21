@@ -1,0 +1,22 @@
+name: pr-title
+
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
+
+jobs:
+  lint-pr-title:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run lint:pr-title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
