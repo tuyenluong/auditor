@@ -12,6 +12,7 @@ export type OpenApiDocument = OpenAPIV3.Document | OpenAPIV3_1.Document;
 export interface ParseSpecOptions {
   allowHosts?: readonly string[];
   specAuthHeader?: string;
+  pinned?: boolean;
 }
 
 interface RefFile {
@@ -134,6 +135,9 @@ async function readContainedFile(specDir: string | undefined, file: RefFile): Pr
 }
 
 async function readAllowlistedUrl(options: ParseSpecOptions, file: RefFile): Promise<Buffer> {
+  if (options.pinned === true) {
+    throw new AuditorError(`Pinned spec has a remote $ref: ${file.url}`, "SPEC_PIN");
+  }
   const ref = refLabel(file);
   try {
     const fetched = await fetchSpec(file.url, options);

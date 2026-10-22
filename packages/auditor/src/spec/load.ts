@@ -20,7 +20,7 @@ export async function loadSpec(location: string, options: LoadSpecOptions = {}):
   if (options.pinPath !== undefined) {
     const bytes = await readPin(options.pinPath);
     return {
-      document: await parseSpec(bytes, options),
+      document: await parseSpec(bytes, { pinned: true }),
       source: "pinned",
       location: options.pinPath,
     };

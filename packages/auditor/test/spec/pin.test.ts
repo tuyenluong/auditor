@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -108,6 +108,57 @@ it("throws SPEC_PIN when the pinned spec is missing", async () => {
     expect(error.code).toBe("SPEC_PIN");
     expect(error.message.startsWith("Pinned spec not found:")).toBe(true);
     expect(error.message).toContain(pinPath);
+    expect(requests).toEqual([]);
+  } finally {
+    await closeQuietly(server);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+it("throws SPEC_PIN for a remote $ref in a pinned spec before any request", async () => {
+  const requests: string[] = [];
+  const server = createServer((request, response) => {
+    requests.push(request.url ?? "");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ type: "object", properties: { sku: { type: "string" } } }));
+  });
+  const dir = await mkdtemp(join(tmpdir(), "auditor-pin-"));
+  const pinPath = join(dir, "remote.openapi.yaml");
+
+  try {
+    await listen(server);
+    const ref = urlOf(server).replace(/\/openapi\.json$/, "/sku.json");
+    await writeFile(
+      pinPath,
+      `openapi: 3.0.3
+info:
+  title: Pinned
+  version: "1.0.0"
+paths:
+  /items:
+    get:
+      responses:
+        "200":
+          description: An item
+          content:
+            application/json:
+              schema:
+                $ref: ${ref}
+`,
+    );
+
+    const error = await rejected("http://127.0.0.1/ignored", {
+      allowHosts: ["127.0.0.1"],
+      pinPath,
+    });
+
+    expect(error).toBeInstanceOf(AuditorError);
+    if (!(error instanceof AuditorError)) {
+      return;
+    }
+    expect(error.code).toBe("SPEC_PIN");
+    expect(error.message).toBe(`Pinned spec has a remote $ref: ${ref}`);
+    expect(error.message).not.toContain("allow-host");
     expect(requests).toEqual([]);
   } finally {
     await closeQuietly(server);
