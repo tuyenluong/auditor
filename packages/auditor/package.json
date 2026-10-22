@@ -16,5 +16,10 @@
     "@types/node": "^22.19.0",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"
+  },
+  "dependencies": {
+    "@apidevtools/swagger-parser": "^13.1.0",
+    "js-yaml": "^5.5.0",
+    "openapi-types": "^12.1.3"
   }
 }
