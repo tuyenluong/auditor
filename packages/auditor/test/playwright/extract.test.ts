@@ -336,15 +336,26 @@ it("reads literal headers", () => {
   });
 });
 
-it("leaves expectations empty", () => {
+it("records a status expectation from expect(res.status())", () => {
   const text = [
     "test('a', async ({ request }) => {",
     "  const res = await request.get('/orders');",
     "  expect(res.status()).toBe(200);",
     "})",
   ].join("\n");
+  const position = at(text, "expect(res.status())");
 
-  expect(extractCalls({ path: "orders.spec.ts", text })[0]?.expectations).toEqual([]);
+  expect(extractCalls({ path: "orders.spec.ts", text })[0]?.expectations).toEqual([
+    {
+      responseVar: "res",
+      line: position.line,
+      column: position.column,
+      statuses: [200],
+      contentTypes: [],
+      fields: [],
+      assertions: [],
+    },
+  ]);
 });
 
 it("records multipart as a form body", () => {
