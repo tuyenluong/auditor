@@ -3,33 +3,26 @@ import { join, resolve } from "node:path";
 import {
   SyntaxKind,
   isBinaryExpression,
-  isBindingElement,
   isCallExpression,
-  isClassDeclaration,
   isComputedPropertyName,
   isExportAssignment,
   isExpressionStatement,
-  isFunctionLikeDeclaration,
   isIdentifier,
-  isImportDeclaration,
-  isNamedImports,
-  isObjectBindingPattern,
   isObjectLiteralExpression,
   isPropertyAccessExpression,
   isPropertyAssignment,
   isShorthandPropertyAssignment,
   isSpreadAssignment,
-  isStringLiteral,
-  isVariableDeclaration,
-  type BindingName,
   type Expression,
-  type ImportDeclaration,
-  type Node,
   type ObjectLiteralExpression,
   type SourceFile,
-  type VariableDeclaration,
 } from "typescript/unstable/ast";
-import { createConstantResolver, propertyKey, unwrapExpression } from "./constants.js";
+import {
+  createConstantResolver,
+  propertyKey,
+  unwrapExpression,
+  type ConstantResolver,
+} from "./constants.js";
 import { withSourceFile } from "./parse.js";
 import { splitUrl } from "./url.js";
 
@@ -40,19 +33,11 @@ const CONFIG_FILENAMES = [
   "playwright.config.mjs",
 ] as const;
 
-const MAX_FOLLOW_DEPTH = 10;
-const PLAYWRIGHT_TEST = "@playwright/test";
-
 export type BaseURLResult = { literal: true; value: string } | { literal: false };
 
 export interface StrippedUrl {
   path: string;
   query: Record<string, string>;
-}
-
-interface Bindings {
-  defineConfig: Set<string>;
-  values: Map<string, Expression | undefined>;
 }
 
 export function findPlaywrightConfig(cwd: string, playwrightConfigPath?: string | null): string | undefined {
@@ -78,18 +63,19 @@ export function stripBase(url: string, bases: readonly string[], baseURL?: strin
 function readConfig(source: SourceFile): BaseURLResult | undefined {
   const exported = exportedExpression(source);
   if (!exported) return undefined;
-  const bindings = collectBindings(source);
-  const root = configObject(exported, bindings, 0);
+  const resolver = createConstantResolver(source);
+  const root = configObject(exported, source, resolver, new Set());
+  if (root === "unstable") return { literal: false };
   if (!root) return undefined;
   const use = readProperty(root, "use");
   if (use.kind === "hidden") return { literal: false };
   if (use.kind === "absent") return undefined;
-  const useObject = asObject(use.expression, bindings.values, 0);
+  const useObject = asObject(use.expression, resolver);
   if (!useObject) return { literal: false };
   const baseURL = readProperty(useObject, "baseURL");
   if (baseURL.kind === "hidden") return { literal: false };
   if (baseURL.kind === "absent") return undefined;
-  const resolved = createConstantResolver(source).resolve(baseURL.expression, "non-literal-url");
+  const resolved = resolver.resolve(baseURL.expression, "non-literal-url");
   if (resolved.ok && typeof resolved.value === "string") return { literal: true, value: resolved.value };
   return { literal: false };
 }
@@ -201,98 +187,41 @@ function isModuleExports(expression: Expression): boolean {
   return isIdentifier(object) && object.text === "module";
 }
 
-function collectBindings(source: SourceFile): Bindings {
-  const defineConfig = new Set<string>();
-  const values = new Map<string, Expression | undefined>();
-  const visit = (node: Node): void => {
-    if (isFunctionLikeDeclaration(node) || isClassDeclaration(node)) return;
-    if (isImportDeclaration(node)) {
-      collectImport(node, defineConfig);
-      return;
-    }
-    if (isVariableDeclaration(node) && isIdentifier(node.name)) noteValue(values, node.name.text, node.initializer);
-    if (isVariableDeclaration(node)) collectRequire(node, defineConfig);
-    node.forEachChild(visit);
-  };
-  visit(source);
-  return { defineConfig, values };
-}
-
-function noteValue(values: Map<string, Expression | undefined>, name: string, initializer: Expression | undefined): void {
-  if (values.has(name)) values.set(name, undefined);
-  else values.set(name, initializer);
-}
-
-function collectImport(node: ImportDeclaration, names: Set<string>): void {
-  const clause = node.importClause;
-  if (!clause || clause.phaseModifier === SyntaxKind.TypeKeyword) return;
-  if (!isStringLiteral(node.moduleSpecifier) || node.moduleSpecifier.text !== PLAYWRIGHT_TEST) return;
-  const bindings = clause.namedBindings;
-  if (!bindings || !isNamedImports(bindings)) return;
-  for (const element of bindings.elements) {
-    if (element.isTypeOnly) continue;
-    const imported = element.propertyName?.text ?? element.name.text;
-    if (imported === "defineConfig") names.add(element.name.text);
-  }
-}
-
-function collectRequire(declaration: VariableDeclaration, names: Set<string>): void {
-  if (!declaration.initializer) return;
-  const init = unwrapExpression(declaration.initializer);
-  if (isPlaywrightRequire(init)) {
-    bindRequirePattern(declaration.name, names);
-    return;
-  }
-  if (isIdentifier(declaration.name) && isDefineConfigRequire(init)) names.add(declaration.name.text);
-}
-
-function bindRequirePattern(name: BindingName, names: Set<string>): void {
-  if (!isObjectBindingPattern(name)) return;
-  for (const element of name.elements) {
-    if (!isBindingElement(element) || !element.name || !isIdentifier(element.name)) continue;
-    const imported = element.propertyName ? propertyKey(element.propertyName) : element.name.text;
-    if (imported === "defineConfig") names.add(element.name.text);
-  }
-}
-
-function isPlaywrightRequire(expression: Expression): boolean {
-  if (!isCallExpression(expression) || !isIdentifier(expression.expression) || expression.expression.text !== "require") {
-    return false;
-  }
-  const specifier = expression.arguments[0];
-  return specifier !== undefined && isStringLiteral(specifier) && specifier.text === PLAYWRIGHT_TEST;
-}
-
-function isDefineConfigRequire(expression: Expression): boolean {
-  return (
-    isPropertyAccessExpression(expression) &&
-    expression.name.text === "defineConfig" &&
-    isPlaywrightRequire(unwrapExpression(expression.expression))
-  );
-}
-
-function configObject(expression: Expression, bindings: Bindings, depth: number): ObjectLiteralExpression | undefined {
-  if (depth > MAX_FOLLOW_DEPTH) return undefined;
-  const node = unwrapExpression(expression);
-  if (isCallExpression(node) && isIdentifier(node.expression) && bindings.defineConfig.has(node.expression.text)) {
-    const arg = node.arguments[0];
-    return arg ? configObject(arg, bindings, depth + 1) : undefined;
-  }
-  return asObject(node, bindings.values, depth);
-}
-
-function asObject(
+function configObject(
   expression: Expression,
-  values: Map<string, Expression | undefined>,
-  depth: number,
-): ObjectLiteralExpression | undefined {
-  if (depth > MAX_FOLLOW_DEPTH) return undefined;
+  source: SourceFile,
+  resolver: ConstantResolver,
+  seen: Set<Expression>,
+): ObjectLiteralExpression | "unstable" | undefined {
+  const followed = followedExpression(expression, resolver);
+  if (followed === "unstable") return "unstable";
+  if (!followed) return undefined;
+  if (isCallExpression(followed)) {
+    const callee = unwrapExpression(followed.expression);
+    if (isIdentifier(callee) && resolver.isDefineConfig(callee.text, callee.getStart(source))) {
+      if (seen.has(followed)) return "unstable";
+      seen.add(followed);
+      const arg = followed.arguments[0];
+      return arg ? configObject(arg, source, resolver, seen) : undefined;
+    }
+  }
+  return isObjectLiteralExpression(followed) ? followed : undefined;
+}
+
+function asObject(expression: Expression, resolver: ConstantResolver): ObjectLiteralExpression | undefined {
+  const followed = followedExpression(expression, resolver);
+  if (!followed || followed === "unstable" || !isObjectLiteralExpression(followed)) return undefined;
+  return followed;
+}
+
+function followedExpression(expression: Expression, resolver: ConstantResolver): Expression | "unstable" | undefined {
   const node = unwrapExpression(expression);
-  if (isObjectLiteralExpression(node)) return node;
+  const bound = resolver.boundExpression(node);
+  if (bound) return bound;
   if (!isIdentifier(node)) return undefined;
-  const init = values.get(node.text);
-  if (!init) return undefined;
-  return asObject(init, values, depth + 1);
+  const resolved = resolver.resolve(node, "non-literal-url");
+  if (!resolved.ok && resolved.reason === "ambiguous-constant") return "unstable";
+  return undefined;
 }
 
 type PropertyRead =

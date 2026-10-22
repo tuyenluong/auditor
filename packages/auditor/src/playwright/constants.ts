@@ -82,6 +82,8 @@ export interface ConstantResolver {
   resolve(expression: Expression, fallback: UnresolvedReason): ResolveResult;
   bindingKind(name: string, position: number): BindingKind | undefined;
   isTestCall(node: CallExpression): boolean;
+  isDefineConfig(name: string, position: number): boolean;
+  boundExpression(expression: Expression): Expression | undefined;
 }
 
 export type ResolvedField = Literal | { unresolved: UnresolvedReason };
@@ -108,7 +110,7 @@ interface AssignedBinding {
 }
 
 type Binding =
-  | { kind: "import" }
+  | { kind: "import"; defineConfig?: true }
   | { kind: "imported-request" }
   | { kind: "test" }
   | { kind: "fixture" }
@@ -134,6 +136,13 @@ export function createConstantResolver(source: SourceFile): ConstantResolver {
     },
     isTestCall(node) {
       return isPlaywrightTestCall(root, source, node);
+    },
+    isDefineConfig(name, position) {
+      const binding = lookup(scopeAt(root, position), name);
+      return binding?.kind === "import" && binding.defineConfig === true;
+    },
+    boundExpression(expression) {
+      return followBinding(source, root, expression, 0, new Set());
     },
   };
 }
@@ -294,12 +303,18 @@ class Collector {
   }
 
   private bindDeclaration(scope: Scope, declaration: VariableDeclaration): void {
+    const initializer = declaration.initializer;
+    const opened = initializer ? unwrapExpression(initializer) : undefined;
     if (!isIdentifier(declaration.name)) {
-      this.bindPattern(declaration.name, scope);
+      if (opened && isPlaywrightRequire(opened)) this.bindDefineConfigRequire(declaration.name, scope);
+      else this.bindPattern(declaration.name, scope);
       return;
     }
     const name = declaration.name.text;
-    const initializer = declaration.initializer;
+    if (opened && isDefineConfigRequire(opened)) {
+      this.bindDefineConfigName(scope, name);
+      return;
+    }
     if (initializer && isNewContext(this.current, initializer)) {
       scope.bindings.set(name, { kind: "context", assignments: scope.bindings.has(name) ? 2 : 1, expression: initializer });
       return;
@@ -374,16 +389,43 @@ class Collector {
     for (const element of bindings.elements) {
       if (element.isTypeOnly) continue;
       const imported = element.propertyName?.text ?? element.name.text;
+      const defineConfig = fromPlaywright && imported === "defineConfig";
       const kind: ImportKind =
         fromPlaywright && imported === "request" ? "imported-request"
         : fromPlaywright && imported === "test" ? "test"
         : "import";
-      this.bindImportName(element.name.text, kind);
+      this.bindImportName(element.name.text, kind, defineConfig);
     }
   }
 
-  private bindImportName(name: string, kind: ImportKind): void {
-    if (!this.current.bindings.has(name)) this.current.bindings.set(name, { kind });
+  private bindDefineConfigRequire(name: BindingName, scope: Scope): void {
+    if (!isObjectBindingPattern(name)) {
+      this.bindPattern(name, scope);
+      return;
+    }
+    for (const element of name.elements) {
+      if (!isBindingElement(element) || !element.name) continue;
+      const imported = isIdentifier(element.name)
+        ? element.propertyName
+          ? propertyKey(element.propertyName)
+          : element.name.text
+        : undefined;
+      if (imported === "defineConfig" && isIdentifier(element.name)) {
+        this.bindDefineConfigName(scope, element.name.text);
+        continue;
+      }
+      this.bindPattern(element.name, scope);
+    }
+  }
+
+  private bindDefineConfigName(scope: Scope, name: string): void {
+    if (!scope.bindings.has(name)) scope.bindings.set(name, { kind: "import", defineConfig: true });
+  }
+
+  private bindImportName(name: string, kind: ImportKind, defineConfig = false): void {
+    if (this.current.bindings.has(name)) return;
+    if (defineConfig) this.current.bindings.set(name, { kind: "import", defineConfig: true });
+    else this.current.bindings.set(name, { kind });
   }
 
   private noteAssignments(node: Node): void {
@@ -590,6 +632,41 @@ function recordProperty(
   value[key] = item.value;
   fields[key] = fieldValue(item.value, fallback);
   return undefined;
+}
+
+function followBinding(
+  source: SourceFile,
+  root: Scope,
+  expression: Expression,
+  depth: number,
+  stack: Set<AssignedBinding>,
+): Expression | undefined {
+  const node = unwrapExpression(expression);
+  if (!isIdentifier(node)) return node;
+  const binding = lookup(scopeAt(root, node.getStart(source)), node.text);
+  if (!binding || binding.kind !== "value") return undefined;
+  if (binding.assignments !== 1 || binding.expression === undefined) return undefined;
+  if (stack.has(binding) || depth >= MAX_CONSTANT_DEPTH) return undefined;
+  stack.add(binding);
+  const followed = followBinding(source, root, binding.expression, depth + 1, stack);
+  stack.delete(binding);
+  return followed;
+}
+
+function isPlaywrightRequire(expression: Expression): boolean {
+  if (!isCallExpression(expression) || !isIdentifier(expression.expression) || expression.expression.text !== "require") {
+    return false;
+  }
+  const specifier = expression.arguments[0];
+  return specifier !== undefined && isStringLiteral(specifier) && specifier.text === "@playwright/test";
+}
+
+function isDefineConfigRequire(expression: Expression): boolean {
+  return (
+    isPropertyAccessExpression(expression) &&
+    expression.name.text === "defineConfig" &&
+    isPlaywrightRequire(unwrapExpression(expression.expression))
+  );
 }
 
 function readIdentifier(
