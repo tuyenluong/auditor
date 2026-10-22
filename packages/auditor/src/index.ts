@@ -7,17 +7,20 @@ export type {
 } from "./spec/model.js";
 
 export type {
-  RuleId,
-  Severity,
-  Finding,
-  UnresolvedReason,
-  UnresolvedCall,
   ExtractedCall,
   Literal,
   JsonValue,
   ResponseExpectation,
   JsonFieldAccess,
   Assertion,
+} from "./playwright/model.js";
+
+export type {
+  RuleId,
+  Severity,
+  Finding,
+  UnresolvedReason,
+  UnresolvedCall,
   CheckOptions,
   TestFileInput,
   CheckResult,
