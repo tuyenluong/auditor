@@ -18,8 +18,8 @@ function spec(operations: SpecOperation[], servers: string[] = []): SpecModel {
   };
 }
 
-function call(method: HttpMethod, path: string): ExtractedCall {
-  return {
+function call(method: HttpMethod, path: string, dynamicSegments?: readonly number[]): ExtractedCall {
+  const extracted: ExtractedCall = {
     file: "orders.spec.ts",
     line: 1,
     column: 1,
@@ -32,6 +32,8 @@ function call(method: HttpMethod, path: string): ExtractedCall {
     expectations: [],
     unresolved: [],
   };
+  if (dynamicSegments !== undefined) extracted.dynamicSegments = dynamicSegments;
+  return extracted;
 }
 
 function sourceCall(text: string): ExtractedCall {
@@ -159,6 +161,26 @@ it("does not match a dynamic segment to a static template segment", () => {
     operation: undefined,
     concretePath: "/orders/{}",
   });
+});
+
+it("matches literal /orders/AUDITOR_DYNAMIC_1 to the literal operation", () => {
+  const byId = operation("get", "/orders/{id}");
+  const literal = operation("get", "/orders/AUDITOR_DYNAMIC_1");
+
+  expect(matchOperation(call("get", "/orders/AUDITOR_DYNAMIC_1"), spec([byId, literal]))).toEqual({
+    operation: literal,
+  });
+});
+
+it("shifts a dynamic segment when a server base path is stripped", () => {
+  const byId = operation("get", "/orders/{id}");
+
+  expect(
+    matchOperation(
+      call("get", "https://api.example.com/v1/orders/{}", [2]),
+      spec([byId], ["https://api.example.com/v1"]),
+    ),
+  ).toEqual({ operation: byId });
 });
 
 it("strips a server prefix before matching", () => {
