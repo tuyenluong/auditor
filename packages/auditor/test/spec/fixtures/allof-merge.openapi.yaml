@@ -1,0 +1,32 @@
+openapi: 3.0.3
+info:
+  title: Merged allOf
+  version: "1.0.0"
+paths:
+  /items:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - type: object
+                  properties:
+                    sku:
+                      type: string
+                    qty:
+                      type: number
+                  required:
+                    - sku
+                - type: object
+                  properties:
+                    qty:
+                      type: integer
+                    note:
+                      type: string
+                  required:
+                    - qty
+      responses:
+        "200":
+          description: ok

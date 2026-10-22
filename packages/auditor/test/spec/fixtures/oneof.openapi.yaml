@@ -1,0 +1,48 @@
+openapi: 3.0.3
+info:
+  title: OneOf
+  version: "1.0.0"
+paths:
+  /items:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  properties:
+                    sku:
+                      type: string
+                  required:
+                    - sku
+                - type: object
+                  properties:
+                    qty:
+                      type: integer
+                  required:
+                    - qty
+      responses:
+        "200":
+          description: ok
+    put:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              anyOf:
+                - type: object
+                  properties:
+                    sku:
+                      type: string
+                  required:
+                    - sku
+                - type: object
+                  properties:
+                    id:
+                      type: string
+      responses:
+        "200":
+          description: ok
