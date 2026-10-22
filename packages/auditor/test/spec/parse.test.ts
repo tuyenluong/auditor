@@ -226,6 +226,88 @@ paths:
   }
 });
 
+it("rejects an allowlisted http $ref outside loopback before any request", async () => {
+  const calls: string[] = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
+    calls.push(String(args[0]));
+    return original(...args);
+  }) as typeof fetch;
+
+  const root = await mkdtemp(join(tmpdir(), "auditor-spec-"));
+  const specFile = join(root, "remote.openapi.yaml");
+  const ref = "http://example.com/schemas/item.yaml";
+  await writeFile(
+    specFile,
+    `openapi: 3.0.3
+info:
+  title: Remote
+  version: "1.0.0"
+paths:
+  /items:
+    get:
+      responses:
+        "200":
+          description: An item
+          content:
+            application/json:
+              schema:
+                $ref: ${ref}
+`,
+  );
+
+  try {
+    const error = await rejected(specFile, {
+      allowHosts: ["example.com"],
+      specAuthHeader: "Bearer secret",
+    });
+
+    expect(error).toBeInstanceOf(AuditorError);
+    if (!(error instanceof AuditorError)) {
+      return;
+    }
+    expect(error.code).toBe("SPEC_INVALID");
+    expect(error.message).toContain(ref);
+    expect(error.message).not.toContain("Bearer secret");
+    expect(calls).toEqual([]);
+  } finally {
+    globalThis.fetch = original;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+it("rejects a relative $ref in spec bytes that have no file path", async () => {
+  const bytes = new TextEncoder().encode(`openapi: 3.0.3
+info:
+  title: Bytes
+  version: "1.0.0"
+paths:
+  /x:
+    get:
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: ./other.yaml
+`);
+
+  try {
+    await parseSpec(bytes);
+  } catch (error) {
+    expect(error).toBeInstanceOf(AuditorError);
+    if (!(error instanceof AuditorError)) {
+      return;
+    }
+    expect(error.code).toBe("SPEC_INVALID");
+    expect(error.message).toContain("cannot be resolved without a spec file path");
+    expect(error.message).toContain("./other.yaml");
+    return;
+  }
+  throw new Error("expected parseSpec to reject bytes with a relative $ref");
+});
+
 it("rejects a symlink $ref whose real path leaves the spec directory", async () => {
   const root = await mkdtemp(join(tmpdir(), "auditor-spec-"));
   const specDir = join(root, "spec");
