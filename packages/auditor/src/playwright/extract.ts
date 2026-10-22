@@ -3,16 +3,11 @@ import { API } from "typescript/unstable/sync";
 import {
   SyntaxKind,
   isArrayBindingPattern,
-  isArrayLiteralExpression,
   isArrowFunction,
-  isAsExpression,
-  isAwaitExpression,
   isBindingElement,
   isBlock,
-  isBooleanLiteral,
   isCallExpression,
   isClassDeclaration,
-  isConditionalExpression,
   isConstructorDeclaration,
   isFunctionDeclaration,
   isFunctionExpression,
@@ -24,24 +19,15 @@ import {
   isNamespaceImport,
   isNewExpression,
   isNoSubstitutionTemplateLiteral,
-  isNonNullExpression,
-  isNullLiteral,
   isNumericLiteral,
   isObjectBindingPattern,
   isObjectLiteralExpression,
-  isOmittedExpression,
-  isParenthesizedExpression,
-  isPrefixUnaryExpression,
   isPropertyAccessExpression,
   isPropertyAssignment,
-  isSatisfiesExpression,
   isSetAccessorDeclaration,
   isShorthandPropertyAssignment,
   isSpreadAssignment,
-  isSpreadElement,
   isStringLiteral,
-  isTemplateExpression,
-  isTypeAssertion,
   isVariableDeclaration,
   type BindingName,
   type CallExpression,
@@ -56,6 +42,7 @@ import {
 } from "typescript/unstable/ast";
 import type { HttpMethod } from "../spec/model.js";
 import type { UnresolvedCall, UnresolvedReason } from "../types.js";
+import { createConstantResolver, unwrapExpression, type ConstantResolver, type ResolveResult } from "./constants.js";
 import type { ExtractedCall, JsonValue, Literal } from "./model.js";
 
 const SUPPORTED_EXTENSIONS = new Set([".ts", ".mts", ".cts", ".js", ".mjs", ".cjs"]);
@@ -79,12 +66,6 @@ type ParamRead =
   | { kind: "absent" }
   | { kind: "whole"; reason: UnresolvedReason }
   | { kind: "entries"; entries: Record<string, QueryValue> };
-
-type LiteralRead =
-  | { ok: true; value: Literal }
-  | { ok: false; reason: UnresolvedReason };
-
-type JsonRead = { ok: true; value: JsonValue } | { ok: false; reason: UnresolvedReason };
 
 type FunctionLike = {
   parameters: readonly ParameterDeclaration[];
@@ -142,6 +123,7 @@ function parserApi(): API {
 
 class Extractor {
   private readonly scopes: Map<string, Binding>[] = [new Map()];
+  private readonly constants: ConstantResolver;
   private insideTest = 0;
   private pending: UnresolvedCall[] = [];
   private readonly calls: ExtractedCall[] = [];
@@ -149,7 +131,9 @@ class Extractor {
   constructor(
     private readonly file: string,
     private readonly source: SourceFile,
-  ) {}
+  ) {
+    this.constants = createConstantResolver(source);
+  }
 
   extract(): ExtractedCall[] {
     this.visit(this.source);
@@ -273,24 +257,41 @@ class Extractor {
     let method: HttpMethod | undefined = direct;
     const url = this.readUrl(node.arguments[0], located, callee);
     const optionsArg = node.arguments[1];
-    const options = optionsArg ? this.unwrap(optionsArg) : undefined;
-    const object = options && isObjectLiteralExpression(options) ? options : undefined;
-    if (methodName === "fetch") method = this.readFetchMethod(object, options, located, callee);
 
     let query: Record<string, QueryValue> = { ...url.query };
     let headers: Record<string, QueryValue> = {};
     let body: ExtractedCall["body"];
-    if (options && !object) {
-      const reason = this.expressionReason(options, "non-literal-data");
-      this.push(located, callee, "non-literal-param");
-      this.push(located, callee, "non-literal-header");
-      this.push(located, callee, reason);
-      query = {};
-      body = { unresolved: reason };
-    } else if (object) {
-      query = this.mergeQuery(url.query, this.readParams(object), located, callee);
-      headers = this.readHeaders(object, located, callee);
-      body = this.readBody(object, located, callee);
+    if (!optionsArg) {
+      if (methodName === "fetch") method = "get";
+    } else {
+      const options = unwrapExpression(optionsArg);
+      const object = isObjectLiteralExpression(options) ? options : undefined;
+      if (object) {
+        if (methodName === "fetch") method = this.readFetchMethod(object, located, callee);
+        query = this.mergeQuery(url.query, this.readParams(object), located, callee);
+        headers = this.readHeaders(object, located, callee);
+        body = this.readBody(object, located, callee);
+      } else {
+        const resolved = this.constants.resolve(options, "non-literal-data");
+        const record = resolved.ok ? recordFields(resolved.value) : undefined;
+        if (record) {
+          if (methodName === "fetch") method = this.readRecordMethod(record.method, located, callee);
+          query = this.mergeQuery(url.query, paramsFromRecord(record.params), located, callee);
+          headers = this.readRecordHeaders(record.headers, located, callee);
+          body = this.readRecordBody(record, located, callee);
+        } else {
+          if (methodName === "fetch") {
+            this.push(located, callee, "non-literal-method");
+            method = undefined;
+          }
+          const reason = resolved.ok ? "non-literal-data" : resolved.reason;
+          this.push(located, callee, "non-literal-param");
+          this.push(located, callee, "non-literal-header");
+          this.push(located, callee, reason);
+          query = {};
+          body = { unresolved: reason };
+        }
+      }
     }
 
     const call: ExtractedCall = {
@@ -319,57 +320,78 @@ class Extractor {
       this.push(located, callee, "non-literal-url");
       return { query: {} };
     }
-    const node = this.unwrap(arg);
-    if (isStringLiteral(node) || isNoSubstitutionTemplateLiteral(node)) return splitUrl(node.text);
-    this.push(located, callee, this.expressionReason(node, "non-literal-url"));
-    return { query: {} };
+    const resolved = this.constants.resolve(arg, "non-literal-url");
+    if (!resolved.ok) {
+      this.push(located, callee, resolved.reason);
+      return { query: {} };
+    }
+    if (typeof resolved.value !== "string") {
+      this.push(located, callee, "non-literal-url");
+      return { query: {} };
+    }
+    return splitUrl(resolved.value);
   }
 
   private readFetchMethod(
-    object: ObjectLiteralExpression | undefined,
-    options: Expression | undefined,
+    object: ObjectLiteralExpression,
     located: { line: number; column: number },
     callee: string,
   ): HttpMethod | undefined {
-    if (!options) return "get";
-    if (!object) {
-      this.push(located, callee, "non-literal-method");
-      return undefined;
-    }
-    const initializer = this.propertyInitializer(object, "method");
-    if (initializer === undefined) {
+    const expression = valueExpressionOf(this.findProperty(object, "method"));
+    if (!expression) {
       if (this.hasProperty(object, "method")) this.push(located, callee, "non-literal-method");
       else return "get";
       return undefined;
     }
-    const value = this.unwrap(initializer);
-    if (isStringLiteral(value) || isNoSubstitutionTemplateLiteral(value)) {
-      const method = value.text.toLowerCase();
+    return this.methodFromResolved(this.constants.resolve(expression, "non-literal-method"), located, callee);
+  }
+
+  private readRecordMethod(
+    value: JsonValue | undefined,
+    located: { line: number; column: number },
+    callee: string,
+  ): HttpMethod | undefined {
+    if (typeof value === "string") return this.methodFromResolved({ ok: true, value }, located, callee);
+    if (value === undefined) return "get";
+    this.push(located, callee, "non-literal-method");
+    return undefined;
+  }
+
+  private methodFromResolved(
+    resolved: ResolveResult,
+    located: { line: number; column: number },
+    callee: string,
+  ): HttpMethod | undefined {
+    if (resolved.ok && typeof resolved.value === "string") {
+      const method = resolved.value.toLowerCase();
       if (isHttpMethod(method)) return method;
     }
-    this.push(located, callee, "non-literal-method");
+    this.push(located, callee, resolved.ok ? "non-literal-method" : resolved.reason);
     return undefined;
   }
 
   private readParams(object: ObjectLiteralExpression): ParamRead {
     const property = this.findProperty(object, "params");
     if (!property) return { kind: "absent" };
-    if (!isPropertyAssignment(property)) return { kind: "whole", reason: "non-literal-param" };
-    return this.readParamValue(property.initializer);
+    const expression = valueExpressionOf(property);
+    if (!expression) return { kind: "whole", reason: "non-literal-param" };
+    return this.readParamValue(expression);
   }
 
   private readParamValue(expression: Expression): ParamRead {
-    const node = this.unwrap(expression);
-    if (isObjectLiteralExpression(node)) return this.readLiteralObject(node, "non-literal-param");
-    if (isStringLiteral(node) || isNoSubstitutionTemplateLiteral(node)) {
-      return { kind: "entries", entries: queryFromString(node.text) };
-    }
+    const node = unwrapExpression(expression);
     if (isNewExpression(node) && isIdentifier(node.expression) && node.expression.text === "URLSearchParams") {
       const arg = node.arguments?.[0];
       if (!arg) return { kind: "entries", entries: {} };
       return this.readParamValue(arg);
     }
-    return { kind: "whole", reason: this.expressionReason(node, "non-literal-param") };
+    if (isObjectLiteralExpression(node)) return this.readLiteralObject(node, "non-literal-param");
+    const resolved = this.constants.resolve(node, "non-literal-param");
+    if (!resolved.ok) return { kind: "whole", reason: resolved.reason };
+    if (typeof resolved.value === "string") return { kind: "entries", entries: queryFromString(resolved.value) };
+    const record = recordFields(resolved.value);
+    if (record) return { kind: "entries", entries: entriesFromRecord(record, "non-literal-param") };
+    return { kind: "whole", reason: "non-literal-param" };
   }
 
   private readHeaders(
@@ -379,22 +401,52 @@ class Extractor {
   ): Record<string, QueryValue> {
     const property = this.findProperty(object, "headers");
     if (!property) return {};
-    if (!isPropertyAssignment(property)) {
+    const expression = valueExpressionOf(property);
+    if (!expression) {
       this.push(located, callee, "non-literal-header");
       return {};
     }
-    const value = this.unwrap(property.initializer);
-    if (!isObjectLiteralExpression(value)) {
-      this.push(located, callee, this.expressionReason(value, "non-literal-header"));
+    return this.finishHeaders(this.readRecordValue(expression, "non-literal-header"), located, callee);
+  }
+
+  private readRecordHeaders(
+    value: JsonValue | undefined,
+    located: { line: number; column: number },
+    callee: string,
+  ): Record<string, QueryValue> {
+    const record = value === undefined ? undefined : recordFields(value);
+    if (!record) {
+      if (value !== undefined) this.push(located, callee, "non-literal-header");
       return {};
     }
-    const read = this.readLiteralObject(value, "non-literal-header");
+    return this.finishHeaders(
+      { kind: "entries", entries: entriesFromRecord(record, "non-literal-header") },
+      located,
+      callee,
+    );
+  }
+
+  private finishHeaders(
+    read: ParamRead,
+    located: { line: number; column: number },
+    callee: string,
+  ): Record<string, QueryValue> {
     if (read.kind !== "entries") {
       if (read.kind === "whole") this.push(located, callee, read.reason);
       return {};
     }
     this.pushUnresolvedValues(read.entries, located, callee);
     return read.entries;
+  }
+
+  private readRecordValue(expression: Expression, fallback: UnresolvedReason): ParamRead {
+    const node = unwrapExpression(expression);
+    if (isObjectLiteralExpression(node)) return this.readLiteralObject(node, fallback);
+    const resolved = this.constants.resolve(node, fallback);
+    if (!resolved.ok) return { kind: "whole", reason: resolved.reason };
+    const record = recordFields(resolved.value);
+    if (!record) return { kind: "whole", reason: fallback };
+    return { kind: "entries", entries: entriesFromRecord(record, fallback) };
   }
 
   private readBody(
@@ -408,11 +460,30 @@ class Extractor {
     }
     const property = this.findProperty(object, "data");
     if (!property) return undefined;
-    if (!isPropertyAssignment(property)) {
+    const expression = valueExpressionOf(property);
+    if (!expression) {
       this.push(located, callee, "non-literal-data");
       return { unresolved: "non-literal-data" };
     }
-    return this.readDataValue(property.initializer, located, callee);
+    return this.readDataValue(expression, located, callee);
+  }
+
+  private readRecordBody(
+    record: { [key: string]: JsonValue },
+    located: { line: number; column: number },
+    callee: string,
+  ): ExtractedCall["body"] {
+    if ("form" in record || "multipart" in record) {
+      this.push(located, callee, "form-body");
+      return { unresolved: "form-body" };
+    }
+    if (!("data" in record)) return undefined;
+    const data = record.data;
+    if (typeof data === "string") {
+      this.push(located, callee, "raw-string-body");
+      return { unresolved: "raw-string-body" };
+    }
+    return data;
   }
 
   private readDataValue(
@@ -420,17 +491,16 @@ class Extractor {
     located: { line: number; column: number },
     callee: string,
   ): ExtractedCall["body"] {
-    const node = this.unwrap(expression);
-    if (isStringLiteral(node) || isNoSubstitutionTemplateLiteral(node)) {
+    const resolved = this.constants.resolve(expression, "non-literal-data");
+    if (resolved.ok && typeof resolved.value === "string") {
       this.push(located, callee, "raw-string-body");
       return { unresolved: "raw-string-body" };
     }
-    const read = this.readJson(node, "non-literal-data");
-    if (!read.ok) {
-      this.push(located, callee, read.reason);
-      return { unresolved: read.reason };
+    if (!resolved.ok) {
+      this.push(located, callee, resolved.reason);
+      return { unresolved: resolved.reason };
     }
-    return read.value;
+    return resolved.value;
   }
 
   private mergeQuery(
@@ -473,92 +543,22 @@ class Extractor {
     const entries: Record<string, QueryValue> = {};
     for (const property of node.properties) {
       if (isSpreadAssignment(property)) return { kind: "whole", reason: "spread" };
-      if (isShorthandPropertyAssignment(property)) {
-        const key = this.staticName(property.name);
-        if (key === undefined) return { kind: "whole", reason: "computed-key" };
-        entries[key] = { unresolved: this.identifierReason(key, fallback) };
+      const key = this.propertyName(property);
+      if (key === undefined) return { kind: "whole", reason: "computed-key" };
+      const expression = valueExpressionOf(property);
+      if (!expression) return { kind: "whole", reason: fallback };
+      const resolved = this.constants.resolve(expression, fallback);
+      if (!resolved.ok) {
+        entries[key] = { unresolved: resolved.reason };
         continue;
       }
-      if (!isPropertyAssignment(property)) return { kind: "whole", reason: fallback };
-      const key = this.staticName(property.name);
-      if (key === undefined) return { kind: "whole", reason: "computed-key" };
-      const literal = this.readPrimitive(property.initializer, fallback);
-      entries[key] = literal.ok ? literal.value : { unresolved: literal.reason };
+      if (resolved.value === null || typeof resolved.value !== "object") {
+        entries[key] = resolved.value;
+        continue;
+      }
+      entries[key] = { unresolved: fallback };
     }
     return { kind: "entries", entries };
-  }
-
-  private readPrimitive(expression: Expression, fallback: UnresolvedReason): LiteralRead {
-    const read = this.readJson(expression, fallback);
-    if (!read.ok) return read;
-    if (read.value === null || typeof read.value !== "object") return { ok: true, value: read.value };
-    return { ok: false, reason: fallback };
-  }
-
-  private readJson(expression: Expression, fallback: UnresolvedReason): JsonRead {
-    const node = this.unwrap(expression);
-    if (isStringLiteral(node) || isNoSubstitutionTemplateLiteral(node)) return { ok: true, value: node.text };
-    if (isNumericLiteral(node)) {
-      const value = numberValue(node.text);
-      return value === undefined ? { ok: false, reason: fallback } : { ok: true, value };
-    }
-    if (isPrefixUnaryExpression(node) && isNumericLiteral(node.operand)) {
-      const magnitude = numberValue(node.operand.text);
-      if (magnitude === undefined) return { ok: false, reason: fallback };
-      if (node.operator === SyntaxKind.MinusToken) return { ok: true, value: -magnitude };
-      if (node.operator === SyntaxKind.PlusToken) return { ok: true, value: magnitude };
-      return { ok: false, reason: fallback };
-    }
-    if (isBooleanLiteral(node)) return { ok: true, value: node.kind === SyntaxKind.TrueKeyword };
-    if (isNullLiteral(node)) return { ok: true, value: null };
-    if (isArrayLiteralExpression(node)) {
-      const items: JsonValue[] = [];
-      for (const element of node.elements) {
-        if (isSpreadElement(element)) return { ok: false, reason: "spread" };
-        if (isOmittedExpression(element)) return { ok: false, reason: fallback };
-        const item = this.readJson(element, fallback);
-        if (!item.ok) return item;
-        items.push(item.value);
-      }
-      return { ok: true, value: items };
-    }
-    if (isObjectLiteralExpression(node)) {
-      const value: { [key: string]: JsonValue } = {};
-      for (const property of node.properties) {
-        if (isSpreadAssignment(property)) return { ok: false, reason: "spread" };
-        if (isShorthandPropertyAssignment(property)) {
-          const key = this.staticName(property.name);
-          return { ok: false, reason: key === undefined ? "computed-key" : this.identifierReason(key, fallback) };
-        }
-        if (!isPropertyAssignment(property)) return { ok: false, reason: fallback };
-        const key = this.staticName(property.name);
-        if (key === undefined) return { ok: false, reason: "computed-key" };
-        const item = this.readJson(property.initializer, fallback);
-        if (!item.ok) return item;
-        value[key] = item.value;
-      }
-      return { ok: true, value };
-    }
-    return { ok: false, reason: this.expressionReason(node, fallback) };
-  }
-
-  private expressionReason(node: Expression, fallback: UnresolvedReason): UnresolvedReason {
-    if (isCallExpression(node)) return "helper-call";
-    if (isIdentifier(node)) return this.identifierReason(node.text, fallback);
-    if (isConditionalExpression(node)) return "ambiguous-constant";
-    if (isTemplateExpression(node)) {
-      for (const span of node.templateSpans) {
-        const reason = this.expressionReason(this.unwrap(span.expression), fallback);
-        if (reason !== fallback) return reason;
-      }
-    }
-    return fallback;
-  }
-
-  private identifierReason(name: string, fallback: UnresolvedReason): UnresolvedReason {
-    const kind = this.lookup(name);
-    if (kind === "import" || kind === "imported-request" || kind === "test") return "imported-value";
-    return fallback;
   }
 
   private recordImport(node: ImportDeclaration): void {
@@ -600,14 +600,14 @@ class Extractor {
   }
 
   private isNewContext(expression: Expression): boolean {
-    const node = this.unwrap(expression);
+    const node = unwrapExpression(expression);
     if (!isCallExpression(node) || !isPropertyAccessExpression(node.expression)) return false;
     if (!isIdentifier(node.expression.expression) || node.expression.name.text !== "newContext") return false;
     return this.lookup(node.expression.expression.text) === "imported-request";
   }
 
   private asFunction(expression: Expression): FunctionLike | undefined {
-    const node = this.unwrap(expression);
+    const node = unwrapExpression(expression);
     if (isArrowFunction(node) || isFunctionExpression(node)) return node;
     return undefined;
   }
@@ -629,21 +629,6 @@ class Extractor {
     return names;
   }
 
-  private unwrap(expression: Expression): Expression {
-    let current = expression;
-    while (
-      isAwaitExpression(current) ||
-      isParenthesizedExpression(current) ||
-      isAsExpression(current) ||
-      isSatisfiesExpression(current) ||
-      isTypeAssertion(current) ||
-      isNonNullExpression(current)
-    ) {
-      current = current.expression;
-    }
-    return current;
-  }
-
   private findProperty(object: ObjectLiteralExpression, name: string): ObjectLiteralElementLike | undefined {
     for (const property of object.properties) {
       if (this.propertyName(property) === name) return property;
@@ -653,12 +638,6 @@ class Extractor {
 
   private hasProperty(object: ObjectLiteralExpression, name: string): boolean {
     return this.findProperty(object, name) !== undefined;
-  }
-
-  private propertyInitializer(object: ObjectLiteralExpression, name: string): Expression | undefined {
-    const property = this.findProperty(object, name);
-    if (property && isPropertyAssignment(property)) return property.initializer;
-    return undefined;
   }
 
   private propertyName(property: ObjectLiteralElementLike): string | undefined {
@@ -764,9 +743,35 @@ function isUnresolved(value: QueryValue): value is { unresolved: UnresolvedReaso
   return typeof value === "object" && value !== null && "unresolved" in value;
 }
 
-function numberValue(text: string): number | undefined {
-  const value = Number(text.replaceAll("_", ""));
-  return Number.isFinite(value) ? value : undefined;
+function valueExpressionOf(property: ObjectLiteralElementLike | undefined): Expression | undefined {
+  if (!property) return undefined;
+  if (isPropertyAssignment(property)) return property.initializer;
+  if (isShorthandPropertyAssignment(property) && isIdentifier(property.name)) return property.name;
+  return undefined;
+}
+
+function recordFields(value: JsonValue): { [key: string]: JsonValue } | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  return value as { [key: string]: JsonValue };
+}
+
+function entriesFromRecord(
+  value: { [key: string]: JsonValue },
+  fallback: UnresolvedReason,
+): Record<string, QueryValue> {
+  const entries: Record<string, QueryValue> = {};
+  for (const [key, item] of Object.entries(value)) {
+    entries[key] = item === null || typeof item !== "object" ? item : { unresolved: fallback };
+  }
+  return entries;
+}
+
+function paramsFromRecord(value: JsonValue | undefined): ParamRead {
+  if (value === undefined) return { kind: "absent" };
+  if (typeof value === "string") return { kind: "entries", entries: queryFromString(value) };
+  const record = recordFields(value);
+  if (record) return { kind: "entries", entries: entriesFromRecord(record, "non-literal-param") };
+  return { kind: "whole", reason: "non-literal-param" };
 }
 
 function splitUrl(url: string): { path: string; query: Record<string, string> } {
