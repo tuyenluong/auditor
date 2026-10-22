@@ -7,6 +7,7 @@
     "moduleResolution": "NodeNext",
     "target": "ES2022",
     "verbatimModuleSyntax": true,
-    "esModuleInterop": true
+    "esModuleInterop": true,
+    "types": ["node"]
   }
 }
