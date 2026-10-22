@@ -8,6 +8,7 @@ export interface ExtractedCall {
   callee: string;
   method?: HttpMethod; // omitted when the method did not resolve
   path?: string; // stripped path, query removed; omitted when unresolved
+  dynamicSegments?: readonly number[]; // indexes on the path before base stripping
   pathParams: Record<string, Literal | { unresolved: UnresolvedReason }>;
   query: Record<string, Literal | { unresolved: UnresolvedReason }>;
   headers: Record<string, Literal | { unresolved: UnresolvedReason }>;

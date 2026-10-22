@@ -27,7 +27,7 @@ import {
 } from "./constants.js";
 import type { ExtractedCall, JsonValue, Literal } from "./model.js";
 import { withSourceFile } from "./parse.js";
-import { queryFromString, splitUrl } from "./url.js";
+import { queryFromString, splitUrl, takeDynamicPath } from "./url.js";
 
 const HTTP_METHODS = new Set<HttpMethod>([
   "get",
@@ -169,21 +169,29 @@ class Extractor {
     };
     if (method !== undefined) call.method = method;
     if (url.path !== undefined) call.path = url.path;
+    if (url.dynamicSegments !== undefined) call.dynamicSegments = url.dynamicSegments;
     if (body !== undefined) call.body = body;
     return call;
   }
 
-  private readUrl(arg: Expression | undefined, located: Located, callee: string): { path?: string; query: Record<string, string> } {
+  private readUrl(
+    arg: Expression | undefined,
+    located: Located,
+    callee: string,
+  ): { path?: string; query: Record<string, string>; dynamicSegments?: readonly number[] } {
     if (!arg) {
       this.push(located, callee, "non-literal-url");
       return { query: {} };
     }
-    const resolved = this.constants.resolve(arg, "non-literal-url");
+    const resolved = this.constants.resolve(arg, "non-literal-url", { dynamicPath: true });
     if (!resolved.ok || typeof resolved.value !== "string") {
       this.push(located, callee, resolved.ok ? "non-literal-url" : resolved.reason);
       return { query: {} };
     }
-    return splitUrl(resolved.value);
+    const split = splitUrl(resolved.value);
+    const marked = takeDynamicPath(split.path);
+    if (marked.dynamicSegments === undefined) return { path: marked.path, query: split.query };
+    return { path: marked.path, query: split.query, dynamicSegments: marked.dynamicSegments };
   }
 
   private readMethod(object: ObjectLiteralExpression, located: Located, callee: string): HttpMethod | undefined {

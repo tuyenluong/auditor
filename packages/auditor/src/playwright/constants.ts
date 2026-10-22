@@ -75,11 +75,16 @@ import {
 } from "typescript/unstable/ast";
 import type { UnresolvedReason } from "../types.js";
 import type { JsonValue, Literal } from "./model.js";
+import { DYNAMIC_HOLE } from "./url.js";
 
 const MAX_CONSTANT_DEPTH = 10;
 
+export interface ResolveOptions {
+  dynamicPath?: boolean;
+}
+
 export interface ConstantResolver {
-  resolve(expression: Expression, fallback: UnresolvedReason): ResolveResult;
+  resolve(expression: Expression, fallback: UnresolvedReason, options?: ResolveOptions): ResolveResult;
   bindingKind(name: string, position: number): BindingKind | undefined;
   isTestCall(node: CallExpression): boolean;
   isDefineConfig(name: string, position: number): boolean;
@@ -124,8 +129,8 @@ export function createConstantResolver(source: SourceFile): ConstantResolver {
   const collector = new Collector(source, root);
   collector.collect();
   return {
-    resolve(expression, fallback) {
-      const result = read(source, root, expression, fallback, 0, new Set());
+    resolve(expression, fallback, options) {
+      const result = read(source, root, expression, fallback, 0, new Set(), options?.dynamicPath === true);
       if (!result.ok && !isObjectLiteralExpression(unwrapExpression(expression))) {
         return { ok: false, reason: result.reason };
       }
@@ -502,6 +507,7 @@ function read(
   fallback: UnresolvedReason,
   depth: number,
   stack: Set<AssignedBinding>,
+  dynamicPath = false,
 ): ResolveResult {
   const node = unwrapExpression(expression);
   if (isStringLiteral(node) || isNoSubstitutionTemplateLiteral(node)) return { ok: true, value: node.text };
@@ -513,12 +519,12 @@ function read(
   if (isNullLiteral(node)) return { ok: true, value: null };
   if (isPrefixUnaryExpression(node)) return readUnary(source, root, node, fallback, depth, stack);
   if (isPostfixUnaryExpression(node)) return { ok: false, reason: "ambiguous-constant" };
-  if (isTemplateExpression(node)) return readTemplate(source, root, node, fallback, depth, stack);
+  if (isTemplateExpression(node)) return readTemplate(source, root, node, fallback, depth, stack, dynamicPath);
   if (isArrayLiteralExpression(node)) return readArray(source, root, node, fallback, depth, stack);
   if (isObjectLiteralExpression(node)) return readObject(source, root, node, fallback, depth, stack);
   if (isCallExpression(node)) return { ok: false, reason: "helper-call" };
   if (isConditionalExpression(node)) return { ok: false, reason: "ambiguous-constant" };
-  if (isIdentifier(node)) return readIdentifier(source, root, node, fallback, depth, stack);
+  if (isIdentifier(node)) return readIdentifier(source, root, node, fallback, depth, stack, dynamicPath);
   if (isPropertyAccessExpression(node) || isElementAccessExpression(node)) {
     return { ok: false, reason: importedChain(source, root, node) ? "imported-value" : fallback };
   }
@@ -552,16 +558,77 @@ function readTemplate(
   fallback: UnresolvedReason,
   depth: number,
   stack: Set<AssignedBinding>,
+  dynamicPath: boolean,
 ): ResolveResult {
-  let text = node.head.text;
+  const chunks: TemplateChunk[] = [{ kind: "text", text: node.head.text }];
   for (const span of node.templateSpans) {
     const part = read(source, root, span.expression, fallback, depth, stack);
-    if (!part.ok) return part;
-    const piece = interpolated(part.value);
-    if (piece === undefined) return { ok: false, reason: fallback };
-    text += piece + span.literal.text;
+    if (!part.ok) {
+      if (!(dynamicPath && allowsDynamicHole(span.expression, part.reason))) return { ok: false, reason: part.reason };
+      chunks.push({ kind: "hole", reason: part.reason });
+    } else {
+      const piece = interpolated(part.value);
+      if (piece === undefined) return { ok: false, reason: fallback };
+      chunks.push({ kind: "text", text: piece });
+    }
+    chunks.push({ kind: "text", text: span.literal.text });
   }
-  return { ok: true, value: text };
+  if (!dynamicPath || chunks.every((chunk) => chunk.kind === "text")) {
+    return { ok: true, value: chunks.map((chunk) => (chunk.kind === "text" ? chunk.text : "")).join("") };
+  }
+  return assembleDynamicPath(chunks);
+}
+
+type TemplateChunk = { kind: "text"; text: string } | { kind: "hole"; reason: UnresolvedReason };
+
+function assembleDynamicPath(chunks: readonly TemplateChunk[]): ResolveResult {
+  let value = "";
+  let inSuffix = false;
+  let segmentText = false;
+  let holes = 0;
+  let holeReason: UnresolvedReason | undefined;
+  let failure: UnresolvedReason | undefined;
+
+  const finishSegment = (): void => {
+    if (holes > 1 || (holes === 1 && segmentText)) failure ??= holeReason ?? "non-literal-url";
+    segmentText = false;
+    holes = 0;
+    holeReason = undefined;
+  };
+
+  for (const chunk of chunks) {
+    if (chunk.kind === "hole") {
+      if (inSuffix) {
+        failure ??= chunk.reason;
+        continue;
+      }
+      holes += 1;
+      holeReason ??= chunk.reason;
+      value += DYNAMIC_HOLE;
+      continue;
+    }
+    for (const char of chunk.text) {
+      if (!inSuffix && (char === "?" || char === "#")) {
+        finishSegment();
+        inSuffix = true;
+      } else if (!inSuffix && char === "/") {
+        finishSegment();
+      } else if (!inSuffix) {
+        segmentText = true;
+      }
+      value += char;
+    }
+  }
+  if (!inSuffix) finishSegment();
+  if (failure) return { ok: false, reason: failure };
+  return { ok: true, value };
+}
+
+// `${a + b}` can expand past one segment. Imports and calls stay unresolved notes.
+function allowsDynamicHole(expression: Expression, reason: UnresolvedReason): boolean {
+  if (reason === "imported-value" || reason === "helper-call") return false;
+  const node = unwrapExpression(expression);
+  return !(isBinaryExpression(node) && node.operatorToken.kind === SyntaxKind.PlusToken);
 }
 
 function readArray(
@@ -676,6 +743,7 @@ function readIdentifier(
   fallback: UnresolvedReason,
   depth: number,
   stack: Set<AssignedBinding>,
+  dynamicPath: boolean,
 ): ResolveResult {
   const binding = lookup(scopeAt(root, node.getStart(source)), node.text);
   if (!binding) return { ok: false, reason: fallback };
@@ -689,7 +757,7 @@ function readIdentifier(
   if (stack.has(binding)) return { ok: false, reason: "ambiguous-constant" };
   if (depth >= MAX_CONSTANT_DEPTH) return { ok: false, reason: "ambiguous-constant" };
   stack.add(binding);
-  const result = read(source, root, binding.expression, fallback, depth + 1, stack);
+  const result = read(source, root, binding.expression, fallback, depth + 1, stack, dynamicPath);
   stack.delete(binding);
   if (!result.ok) return { ok: false, reason: result.reason };
   return result;
