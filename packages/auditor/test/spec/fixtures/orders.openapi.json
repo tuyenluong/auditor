@@ -1,12 +1,99 @@
 {
   "openapi": "3.0.3",
   "info": {
-    "title": "Orders",
+    "title": "Orders API",
     "version": "1.0.0"
   },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:3000"
+    }
+  ],
   "paths": {
-    "/orders/{id}": {
+    "/orders": {
+      "post": {
+        "operationId": "createOrder",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "sku",
+                  "qty"
+                ],
+                "properties": {
+                  "sku": {
+                    "type": "string"
+                  },
+                  "qty": {
+                    "type": "integer"
+                  },
+                  "note": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Order"
+                }
+              }
+            }
+          }
+        }
+      },
       "get": {
+        "operationId": "listOrders",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of orders",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Order"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/orders/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "getOrder",
         "responses": {
           "200": {
             "description": "An order",
@@ -17,6 +104,9 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "Not found"
           }
         }
       }
@@ -26,8 +116,30 @@
     "schemas": {
       "Order": {
         "type": "object",
+        "required": [
+          "id",
+          "sku",
+          "qty",
+          "status"
+        ],
         "properties": {
+          "id": {
+            "type": "string"
+          },
           "sku": {
+            "type": "string"
+          },
+          "qty": {
+            "type": "integer"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "shipped"
+            ]
+          },
+          "note": {
             "type": "string"
           }
         }

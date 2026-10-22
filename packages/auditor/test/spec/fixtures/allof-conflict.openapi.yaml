@@ -1,0 +1,18 @@
+openapi: 3.0.3
+info:
+  title: Conflicting allOf
+  version: "1.0.0"
+paths:
+  /values:
+    put:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - type: string
+                - type: integer
+      responses:
+        "200":
+          description: ok
