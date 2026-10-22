@@ -1,14 +1,17 @@
 export type {
   HttpMethod,
+  SpecParameter,
+  JsonSchema,
+  SpecOperation,
+  SpecModel,
+} from "./spec/model.js";
+
+export type {
   RuleId,
   Severity,
   Finding,
   UnresolvedReason,
   UnresolvedCall,
-  SpecParameter,
-  JsonSchema,
-  SpecOperation,
-  SpecModel,
   ExtractedCall,
   Literal,
   JsonValue,
