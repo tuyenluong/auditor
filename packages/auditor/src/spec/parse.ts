@@ -5,6 +5,7 @@ import SwaggerParser from "@apidevtools/swagger-parser";
 import { load } from "js-yaml";
 import type { OpenAPIV3, OpenAPIV3_1 } from "openapi-types";
 import { AuditorError } from "../errors.js";
+import { isHostAllowlisted } from "./fetch.js";
 
 export type OpenApiDocument = OpenAPIV3.Document | OpenAPIV3_1.Document;
 
@@ -20,10 +21,29 @@ interface RefFile {
 
 export async function parseSpec(
   specPath: string,
+  options?: ParseSpecOptions,
+): Promise<OpenApiDocument>;
+export async function parseSpec(
+  bytes: Uint8Array,
+  options?: ParseSpecOptions,
+): Promise<OpenApiDocument>;
+export async function parseSpec(
+  spec: string | Uint8Array,
   options: ParseSpecOptions = {},
 ): Promise<OpenApiDocument> {
-  const absolute = await resolveSpecPath(specPath);
-  const parsed = parseYaml(await readFile(absolute, "utf8"));
+  if (typeof spec !== "string") {
+    return parseDocument(new TextDecoder().decode(spec), undefined, options);
+  }
+  const absolute = await resolveSpecPath(spec);
+  return parseDocument(await readFile(absolute, "utf8"), absolute, options);
+}
+
+async function parseDocument(
+  text: string,
+  filePath: string | undefined,
+  options: ParseSpecOptions,
+): Promise<OpenApiDocument> {
+  const parsed = parseYaml(text);
   if (!isOpenApi3(parsed)) {
     throw new AuditorError(
       `Expected OpenAPI 3.x, found ${versionFound(parsed)}`,
@@ -31,12 +51,14 @@ export async function parseSpec(
     );
   }
 
+  const specDir = filePath === undefined ? undefined : path.dirname(filePath);
+  const resolver = resolverOptions(specDir, options);
   try {
-    return (await SwaggerParser.validate(
-      absolute,
-      parsed,
-      resolverOptions(path.dirname(absolute), options),
-    )) as OpenApiDocument;
+    const validated =
+      filePath === undefined
+        ? await SwaggerParser.validate(parsed, resolver)
+        : await SwaggerParser.validate(filePath, parsed, resolver);
+    return validated as OpenApiDocument;
   } catch (error) {
     throw parserError(error);
   }
@@ -62,7 +84,10 @@ function parseYaml(text: string): unknown {
   }
 }
 
-function resolverOptions(specDir: string, options: ParseSpecOptions): SwaggerParser.Options {
+function resolverOptions(
+  specDir: string | undefined,
+  options: ParseSpecOptions,
+): SwaggerParser.Options {
   return {
     parse: {
       text: false,
@@ -91,7 +116,13 @@ function isHttpRef(file: RefFile): boolean {
   return /^https?:\/\//i.test(file.url);
 }
 
-async function readContainedFile(specDir: string, file: RefFile): Promise<Buffer> {
+async function readContainedFile(specDir: string | undefined, file: RefFile): Promise<Buffer> {
+  if (specDir === undefined) {
+    throw new AuditorError(
+      `Relative $ref escapes the spec directory: ${refLabel(file)}`,
+      "SPEC_INVALID",
+    );
+  }
   const candidate = await nearestRealPath(toFilePath(file.url));
   if (!isInside(specDir, candidate)) {
     throw new AuditorError(
@@ -102,6 +133,7 @@ async function readContainedFile(specDir: string, file: RefFile): Promise<Buffer
   return readFile(candidate);
 }
 
+// Allowlisted http and https $refs. Failures stay SPEC_INVALID (spec-loading rules).
 async function readAllowlistedUrl(options: ParseSpecOptions, file: RefFile): Promise<Buffer> {
   const ref = refLabel(file);
   let hostname: string;
@@ -110,7 +142,7 @@ async function readAllowlistedUrl(options: ParseSpecOptions, file: RefFile): Pro
   } catch {
     throw new AuditorError(`External $ref ${ref} is not allowlisted`, "SPEC_INVALID");
   }
-  if (!isHostAllowed(hostname, options.allowHosts)) {
+  if (!isHostAllowlisted(hostname, options.allowHosts)) {
     throw new AuditorError(`External $ref ${ref} is not allowlisted`, "SPEC_INVALID");
   }
 
@@ -167,26 +199,6 @@ function isInside(root: string, target: string): boolean {
     relative === "" ||
     (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
   );
-}
-
-function isHostAllowed(hostname: string, allowHosts: readonly string[] | undefined): boolean {
-  const host = hostname.toLowerCase();
-  return (allowHosts ?? []).some((entry) => hostEntry(entry) === host);
-}
-
-function hostEntry(entry: string): string {
-  const trimmed = entry.trim().toLowerCase();
-  if (trimmed.startsWith("[")) {
-    const end = trimmed.indexOf("]");
-    if (end !== -1) {
-      return trimmed.slice(1, end);
-    }
-  }
-  const colon = trimmed.lastIndexOf(":");
-  if (colon > 0 && /^\d+$/.test(trimmed.slice(colon + 1))) {
-    return trimmed.slice(0, colon);
-  }
-  return trimmed;
 }
 
 function isOpenApi3(doc: unknown): doc is OpenApiDocument {
