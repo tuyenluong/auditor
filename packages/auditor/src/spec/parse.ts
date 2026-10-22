@@ -5,7 +5,7 @@ import SwaggerParser from "@apidevtools/swagger-parser";
 import { load } from "js-yaml";
 import type { OpenAPIV3, OpenAPIV3_1 } from "openapi-types";
 import { AuditorError } from "../errors.js";
-import { isHostAllowlisted } from "./fetch.js";
+import { fetchSpec } from "./fetch.js";
 
 export type OpenApiDocument = OpenAPIV3.Document | OpenAPIV3_1.Document;
 
@@ -119,7 +119,7 @@ function isHttpRef(file: RefFile): boolean {
 async function readContainedFile(specDir: string | undefined, file: RefFile): Promise<Buffer> {
   if (specDir === undefined) {
     throw new AuditorError(
-      `Relative $ref escapes the spec directory: ${refLabel(file)}`,
+      `Relative $ref ${refLabel(file)} cannot be resolved without a spec file path`,
       "SPEC_INVALID",
     );
   }
@@ -133,32 +133,40 @@ async function readContainedFile(specDir: string | undefined, file: RefFile): Pr
   return readFile(candidate);
 }
 
-// Allowlisted http and https $refs. Failures stay SPEC_INVALID (spec-loading rules).
 async function readAllowlistedUrl(options: ParseSpecOptions, file: RefFile): Promise<Buffer> {
   const ref = refLabel(file);
-  let hostname: string;
   try {
-    hostname = new URL(file.url).hostname;
-  } catch {
-    throw new AuditorError(`External $ref ${ref} is not allowlisted`, "SPEC_INVALID");
+    const fetched = await fetchSpec(file.url, options);
+    return Buffer.from(fetched.bytes);
+  } catch (error) {
+    throw refFetchError(ref, error, options.specAuthHeader);
   }
-  if (!isHostAllowlisted(hostname, options.allowHosts)) {
-    throw new AuditorError(`External $ref ${ref} is not allowlisted`, "SPEC_INVALID");
-  }
+}
 
-  const headers = new Headers();
-  if (options.specAuthHeader !== undefined) {
-    headers.set("Authorization", options.specAuthHeader);
+function refFetchError(
+  ref: string,
+  error: unknown,
+  specAuthHeader: string | undefined,
+): AuditorError {
+  const detail = withoutAuthHeader(
+    error instanceof Error ? error.message : "unknown error",
+    specAuthHeader,
+  );
+  if (
+    error instanceof AuditorError &&
+    error.code === "SPEC_FETCH" &&
+    detail.includes("not allowlisted")
+  ) {
+    return new AuditorError(`External $ref ${ref} is not allowlisted`, "SPEC_INVALID");
   }
-  const response = await fetch(file.url, { headers, redirect: "manual" });
-  if (!response.ok) {
-    await response.body?.cancel().catch(() => undefined);
-    throw new AuditorError(
-      `Invalid OpenAPI: failed to read $ref ${ref}: HTTP ${response.status}`,
-      "SPEC_INVALID",
-    );
+  return new AuditorError(`Invalid OpenAPI: failed to read $ref ${ref}: ${detail}`, "SPEC_INVALID");
+}
+
+function withoutAuthHeader(message: string, specAuthHeader: string | undefined): string {
+  if (specAuthHeader === undefined || specAuthHeader.length === 0) {
+    return message;
   }
-  return Buffer.from(await response.arrayBuffer());
+  return message.replaceAll(specAuthHeader, "[redacted]");
 }
 
 function refLabel(file: RefFile): string {

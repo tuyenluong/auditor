@@ -37,7 +37,7 @@ export async function fetchSpec(
   }
 }
 
-export function isHostAllowlisted(
+function isHostAllowlisted(
   hostname: string,
   allowHosts: readonly string[] | undefined,
 ): boolean {
