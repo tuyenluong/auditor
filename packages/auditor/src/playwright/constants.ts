@@ -4,6 +4,7 @@ import {
   SyntaxKind,
   isArrayBindingPattern,
   isArrayLiteralExpression,
+  isArrowFunction,
   isAsExpression,
   isAssignmentOperator,
   isAwaitExpression,
@@ -52,14 +53,18 @@ import {
   isVariableDeclarationList,
   isVariableStatement,
   type ArrayLiteralExpression,
+  type ArrowFunction,
   type BinaryExpression,
   type BindingName,
+  type CallExpression,
   type Expression,
   type ForInitializer,
+  type FunctionExpression,
   type FunctionLikeDeclaration,
   type Identifier,
   type ImportDeclaration,
   type Node,
+  type ObjectLiteralElementLike,
   type ObjectLiteralExpression,
   type PrefixUnaryExpression,
   type PropertyName,
@@ -69,15 +74,23 @@ import {
   type VariableDeclarationList,
 } from "typescript/unstable/ast";
 import type { UnresolvedReason } from "../types.js";
-import type { JsonValue } from "./model.js";
+import type { JsonValue, Literal } from "./model.js";
 
 const MAX_CONSTANT_DEPTH = 10;
 
 export interface ConstantResolver {
   resolve(expression: Expression, fallback: UnresolvedReason): ResolveResult;
+  bindingKind(name: string, position: number): BindingKind | undefined;
+  isTestCall(node: CallExpression): boolean;
 }
 
-export type ResolveResult = { ok: true; value: JsonValue } | { ok: false; reason: UnresolvedReason };
+export type ResolvedField = Literal | { unresolved: UnresolvedReason };
+
+export type ResolveResult =
+  | { ok: true; value: JsonValue }
+  | { ok: false; reason: UnresolvedReason; fields?: Record<string, ResolvedField> };
+
+export type BindingKind = Binding["kind"];
 
 interface Scope {
   parent?: Scope;
@@ -88,13 +101,21 @@ interface Scope {
   children: Scope[];
 }
 
-interface ValueBinding {
-  kind: "value";
+interface AssignedBinding {
+  kind: "value" | "context";
   assignments: number;
   expression?: Expression;
 }
 
-type Binding = { kind: "import" } | { kind: "other" } | ValueBinding;
+type Binding =
+  | { kind: "import" }
+  | { kind: "imported-request" }
+  | { kind: "test" }
+  | { kind: "fixture" }
+  | { kind: "other" }
+  | AssignedBinding;
+
+type ImportKind = "import" | "imported-request" | "test";
 
 export function createConstantResolver(source: SourceFile): ConstantResolver {
   const root = createScope(undefined, source, source, true);
@@ -102,7 +123,17 @@ export function createConstantResolver(source: SourceFile): ConstantResolver {
   collector.collect();
   return {
     resolve(expression, fallback) {
-      return read(source, root, expression, fallback, 0, new Set());
+      const result = read(source, root, expression, fallback, 0, new Set());
+      if (!result.ok && !isObjectLiteralExpression(unwrapExpression(expression))) {
+        return { ok: false, reason: result.reason };
+      }
+      return result;
+    },
+    bindingKind(name, position) {
+      return lookup(scopeAt(root, position), name)?.kind;
+    },
+    isTestCall(node) {
+      return isPlaywrightTestCall(root, source, node);
     },
   };
 }
@@ -120,6 +151,28 @@ export function unwrapExpression(expression: Expression): Expression {
     current = current.expression;
   }
   return current;
+}
+
+export function propertyKey(name: PropertyName): string | undefined {
+  if (
+    isIdentifier(name) ||
+    isStringLiteral(name) ||
+    isNumericLiteral(name) ||
+    isNoSubstitutionTemplateLiteral(name)
+  ) {
+    return name.text;
+  }
+  return undefined;
+}
+
+export function testCallback(node: CallExpression): { index: number; fn?: ArrowFunction | FunctionExpression } {
+  for (let index = node.arguments.length - 1; index >= 0; index -= 1) {
+    const arg = node.arguments[index];
+    if (!arg) continue;
+    const fn = unwrapExpression(arg);
+    if (isArrowFunction(fn) || isFunctionExpression(fn)) return { index, fn };
+  }
+  return { index: -1 };
 }
 
 class Collector {
@@ -190,7 +243,11 @@ class Collector {
       return;
     }
     if (isImportEqualsDeclaration(node)) {
-      if (!node.isTypeOnly) this.bindImportName(node.name.text);
+      if (!node.isTypeOnly) this.bindImportName(node.name.text, "import");
+      return;
+    }
+    if (isCallExpression(node) && isPlaywrightTestCall(this.root, this.source, node)) {
+      this.visitTestCall(node);
       return;
     }
     this.visitChildren(node);
@@ -202,12 +259,25 @@ class Collector {
     });
   }
 
-  private visitFunction(node: FunctionLikeDeclaration): void {
+  private visitTestCall(node: CallExpression): void {
+    const callback = testCallback(node);
+    for (let index = 0; index < node.arguments.length; index += 1) {
+      const arg = node.arguments[index];
+      if (arg && index !== callback.index) this.visit(arg);
+    }
+    if (!callback.fn) return;
+    this.visitFunction(callback.fn, new Set(fixtureNames(callback.fn.parameters[0])));
+  }
+
+  private visitFunction(node: FunctionLikeDeclaration, fixtures?: ReadonlySet<string>): void {
     if (isFunctionDeclaration(node) && node.name) this.current.bindings.set(node.name.text, { kind: "other" });
     this.push(node, true);
     if (isFunctionExpression(node) && node.name) this.current.bindings.set(node.name.text, { kind: "other" });
-    for (const param of node.parameters) {
-      this.bindPattern(param.name, this.current);
+    for (let index = 0; index < node.parameters.length; index += 1) {
+      const param = node.parameters[index];
+      if (!param) continue;
+      if (index === 0 && fixtures) this.bindFixture(param.name, fixtures);
+      else this.bindPattern(param.name, this.current);
       if (param.initializer) this.visit(param.initializer);
     }
     if (node.body) this.visit(node.body);
@@ -229,12 +299,17 @@ class Collector {
       return;
     }
     const name = declaration.name.text;
+    const initializer = declaration.initializer;
+    if (initializer && isNewContext(this.current, initializer)) {
+      scope.bindings.set(name, { kind: "context", assignments: scope.bindings.has(name) ? 2 : 1, expression: initializer });
+      return;
+    }
     if (scope.bindings.has(name)) {
       scope.bindings.set(name, { kind: "value", assignments: 2 });
       return;
     }
-    if (declaration.initializer) {
-      scope.bindings.set(name, { kind: "value", assignments: 1, expression: declaration.initializer });
+    if (initializer) {
+      scope.bindings.set(name, { kind: "value", assignments: 1, expression: initializer });
       return;
     }
     scope.bindings.set(name, { kind: "value", assignments: 0 });
@@ -246,7 +321,25 @@ class Collector {
     for (const declaration of initializer.declarations) this.bindPattern(declaration.name, scope);
   }
 
-  private bindPattern(name: BindingName, scope: Scope): void {
+  private bindFixture(name: BindingName | undefined, fixtures: ReadonlySet<string>): void {
+    if (!name) return;
+    if (isIdentifier(name)) {
+      this.current.bindings.set(name.text, fixtures.has(name.text) ? { kind: "fixture" } : { kind: "other" });
+      return;
+    }
+    if (!isObjectBindingPattern(name) && !isArrayBindingPattern(name)) return;
+    for (const element of name.elements) {
+      if (!isBindingElement(element) || !element.name) continue;
+      if (isIdentifier(element.name) && fixtures.has(element.name.text)) {
+        this.current.bindings.set(element.name.text, { kind: "fixture" });
+        continue;
+      }
+      this.bindPattern(element.name, this.current);
+    }
+  }
+
+  private bindPattern(name: BindingName | undefined, scope: Scope): void {
+    if (!name) return;
     if (isIdentifier(name)) {
       scope.bindings.set(name.text, { kind: "other" });
       return;
@@ -269,21 +362,28 @@ class Collector {
   private bindImport(node: ImportDeclaration): void {
     const clause = node.importClause;
     if (!clause || clause.phaseModifier === SyntaxKind.TypeKeyword) return;
-    if (clause.name) this.bindImportName(clause.name.text);
+    const fromPlaywright = isStringLiteral(node.moduleSpecifier) && node.moduleSpecifier.text === "@playwright/test";
+    if (clause.name) this.bindImportName(clause.name.text, "import");
     const bindings = clause.namedBindings;
     if (!bindings) return;
     if (isNamespaceImport(bindings)) {
-      this.bindImportName(bindings.name.text);
+      this.bindImportName(bindings.name.text, "import");
       return;
     }
     if (!isNamedImports(bindings)) return;
     for (const element of bindings.elements) {
-      if (!element.isTypeOnly) this.bindImportName(element.name.text);
+      if (element.isTypeOnly) continue;
+      const imported = element.propertyName?.text ?? element.name.text;
+      const kind: ImportKind =
+        fromPlaywright && imported === "request" ? "imported-request"
+        : fromPlaywright && imported === "test" ? "test"
+        : "import";
+      this.bindImportName(element.name.text, kind);
     }
   }
 
-  private bindImportName(name: string): void {
-    if (!this.current.bindings.has(name)) this.current.bindings.set(name, { kind: "import" });
+  private bindImportName(name: string, kind: ImportKind): void {
+    if (!this.current.bindings.has(name)) this.current.bindings.set(name, { kind });
   }
 
   private noteAssignments(node: Node): void {
@@ -333,7 +433,7 @@ class Collector {
 
   private noteWrite(name: Identifier, expression: Expression | undefined, reassign: boolean): void {
     const binding = lookup(scopeAt(this.root, name.getStart(this.source)), name.text);
-    if (!binding || binding.kind !== "value") return;
+    if (!binding || (binding.kind !== "value" && binding.kind !== "context")) return;
     if (reassign) {
       binding.assignments += 2;
       return;
@@ -359,7 +459,7 @@ function read(
   expression: Expression,
   fallback: UnresolvedReason,
   depth: number,
-  stack: Set<ValueBinding>,
+  stack: Set<AssignedBinding>,
 ): ResolveResult {
   const node = unwrapExpression(expression);
   if (isStringLiteral(node) || isNoSubstitutionTemplateLiteral(node)) return { ok: true, value: node.text };
@@ -390,7 +490,7 @@ function readUnary(
   node: PrefixUnaryExpression,
   fallback: UnresolvedReason,
   depth: number,
-  stack: Set<ValueBinding>,
+  stack: Set<AssignedBinding>,
 ): ResolveResult {
   if (node.operator === SyntaxKind.PlusPlusToken || node.operator === SyntaxKind.MinusMinusToken) {
     return { ok: false, reason: "ambiguous-constant" };
@@ -409,7 +509,7 @@ function readTemplate(
   node: TemplateExpression,
   fallback: UnresolvedReason,
   depth: number,
-  stack: Set<ValueBinding>,
+  stack: Set<AssignedBinding>,
 ): ResolveResult {
   let text = node.head.text;
   for (const span of node.templateSpans) {
@@ -428,7 +528,7 @@ function readArray(
   node: ArrayLiteralExpression,
   fallback: UnresolvedReason,
   depth: number,
-  stack: Set<ValueBinding>,
+  stack: Set<AssignedBinding>,
 ): ResolveResult {
   const items: JsonValue[] = [];
   for (const element of node.elements) {
@@ -447,29 +547,49 @@ function readObject(
   node: ObjectLiteralExpression,
   fallback: UnresolvedReason,
   depth: number,
-  stack: Set<ValueBinding>,
+  stack: Set<AssignedBinding>,
 ): ResolveResult {
   const value: { [key: string]: JsonValue } = {};
+  const fields: Record<string, ResolvedField> = {};
+  let failure: UnresolvedReason | undefined;
   for (const property of node.properties) {
     if (isSpreadAssignment(property)) return { ok: false, reason: "spread" };
+    if (isComputedName(property)) return { ok: false, reason: "computed-key" };
     if (isShorthandPropertyAssignment(property)) {
-      if (property.objectAssignmentInitializer || !isIdentifier(property.name)) {
-        return { ok: false, reason: fallback };
-      }
-      const item = read(source, root, property.name, fallback, depth, stack);
-      if (!item.ok) return item;
-      value[property.name.text] = item.value;
+      if (property.objectAssignmentInitializer || !isIdentifier(property.name)) return { ok: false, reason: fallback };
+      const reason = recordProperty(source, root, value, fields, property.name.text, property.name, fallback, depth, stack);
+      if (reason) failure ??= reason;
       continue;
     }
     if (!isPropertyAssignment(property)) return { ok: false, reason: fallback };
-    if (isComputedPropertyName(property.name)) return { ok: false, reason: "computed-key" };
-    const key = staticKey(property.name);
+    const key = propertyKey(property.name);
     if (key === undefined) return { ok: false, reason: fallback };
-    const item = read(source, root, property.initializer, fallback, depth, stack);
-    if (!item.ok) return item;
-    value[key] = item.value;
+    const reason = recordProperty(source, root, value, fields, key, property.initializer, fallback, depth, stack);
+    if (reason) failure ??= reason;
   }
+  if (failure) return { ok: false, reason: failure, fields };
   return { ok: true, value };
+}
+
+function recordProperty(
+  source: SourceFile,
+  root: Scope,
+  value: { [key: string]: JsonValue },
+  fields: Record<string, ResolvedField>,
+  key: string,
+  expression: Expression,
+  fallback: UnresolvedReason,
+  depth: number,
+  stack: Set<AssignedBinding>,
+): UnresolvedReason | undefined {
+  const item = read(source, root, expression, fallback, depth, stack);
+  if (!item.ok) {
+    fields[key] = { unresolved: item.reason };
+    return item.reason;
+  }
+  value[key] = item.value;
+  fields[key] = fieldValue(item.value, fallback);
+  return undefined;
 }
 
 function readIdentifier(
@@ -478,12 +598,14 @@ function readIdentifier(
   node: Identifier,
   fallback: UnresolvedReason,
   depth: number,
-  stack: Set<ValueBinding>,
+  stack: Set<AssignedBinding>,
 ): ResolveResult {
   const binding = lookup(scopeAt(root, node.getStart(source)), node.text);
   if (!binding) return { ok: false, reason: fallback };
-  if (binding.kind === "import") return { ok: false, reason: "imported-value" };
-  if (binding.kind !== "value") return { ok: false, reason: fallback };
+  if (binding.kind === "import" || binding.kind === "imported-request" || binding.kind === "test") {
+    return { ok: false, reason: "imported-value" };
+  }
+  if (binding.kind !== "value" && binding.kind !== "context") return { ok: false, reason: fallback };
   if (binding.assignments !== 1 || binding.expression === undefined) {
     return { ok: false, reason: binding.assignments > 1 ? "ambiguous-constant" : fallback };
   }
@@ -492,6 +614,7 @@ function readIdentifier(
   stack.add(binding);
   const result = read(source, root, binding.expression, fallback, depth + 1, stack);
   stack.delete(binding);
+  if (!result.ok) return { ok: false, reason: result.reason };
   return result;
 }
 
@@ -501,7 +624,7 @@ function readBinary(
   node: BinaryExpression,
   fallback: UnresolvedReason,
   depth: number,
-  stack: Set<ValueBinding>,
+  stack: Set<AssignedBinding>,
 ): ResolveResult {
   if (node.operatorToken.kind !== SyntaxKind.PlusToken) return { ok: false, reason: fallback };
   const left = read(source, root, node.left, fallback, depth, stack);
@@ -514,13 +637,48 @@ function readBinary(
   return { ok: false, reason: fallback };
 }
 
+function isPlaywrightTestCall(root: Scope, source: SourceFile, node: CallExpression): boolean {
+  const expr = node.expression;
+  if (isIdentifier(expr)) return isPlaywrightTest(root, source, expr);
+  if (isPropertyAccessExpression(expr) && isIdentifier(expr.expression)) {
+    const name = expr.name.text;
+    return (name === "only" || name === "skip" || name === "fixme") && isPlaywrightTest(root, source, expr.expression);
+  }
+  return false;
+}
+
+function isPlaywrightTest(root: Scope, source: SourceFile, name: Identifier): boolean {
+  const kind = lookup(scopeAt(root, name.getStart(source)), name.text)?.kind;
+  return kind === "test" || (kind === undefined && name.text === "test");
+}
+
+function isNewContext(scope: Scope, expression: Expression): boolean {
+  const node = unwrapExpression(expression);
+  if (!isCallExpression(node) || !isPropertyAccessExpression(node.expression)) return false;
+  const object = node.expression.expression;
+  if (!isIdentifier(object) || node.expression.name.text !== "newContext") return false;
+  return lookup(scope, object.text)?.kind === "imported-request";
+}
+
+function fixtureNames(parameter: { name?: BindingName } | undefined): string[] {
+  if (!parameter?.name || !isObjectBindingPattern(parameter.name)) return [];
+  const names: string[] = [];
+  for (const element of parameter.name.elements) {
+    if (!isBindingElement(element) || !element.name || !isIdentifier(element.name)) continue;
+    const renamed = element.propertyName === undefined ? element.name.text : propertyKey(element.propertyName);
+    if (renamed === "request") names.push(element.name.text);
+  }
+  return names;
+}
+
 function importedChain(source: SourceFile, root: Scope, expression: Expression): boolean {
   let current = unwrapExpression(expression);
   while (isPropertyAccessExpression(current) || isElementAccessExpression(current)) {
     current = unwrapExpression(current.expression);
   }
   if (!isIdentifier(current)) return false;
-  return lookup(scopeAt(root, current.getStart(source)), current.text)?.kind === "import";
+  const kind = lookup(scopeAt(root, current.getStart(source)), current.text)?.kind;
+  return kind === "import" || kind === "imported-request" || kind === "test";
 }
 
 function createScope(parent: Scope | undefined, node: Node, source: SourceFile, functionScoped: boolean): Scope {
@@ -560,16 +718,14 @@ function lookup(scope: Scope, name: string): Binding | undefined {
   return undefined;
 }
 
-function staticKey(name: PropertyName): string | undefined {
-  if (
-    isIdentifier(name) ||
-    isStringLiteral(name) ||
-    isNumericLiteral(name) ||
-    isNoSubstitutionTemplateLiteral(name)
-  ) {
-    return name.text;
-  }
-  return undefined;
+function isComputedName(property: ObjectLiteralElementLike): boolean {
+  if (isSpreadAssignment(property)) return false;
+  return isComputedPropertyName(property.name);
+}
+
+function fieldValue(value: JsonValue, fallback: UnresolvedReason): ResolvedField {
+  if (value === null || typeof value !== "object") return value;
+  return { unresolved: fallback };
 }
 
 function interpolated(value: JsonValue): string | undefined {
