@@ -86,6 +86,8 @@ export interface ResolveOptions {
 export interface ConstantResolver {
   resolve(expression: Expression, fallback: UnresolvedReason, options?: ResolveOptions): ResolveResult;
   bindingKind(name: string, position: number): BindingKind | undefined;
+  assignment(name: string, position: number): { assignments: number; expression?: Expression } | undefined;
+  isExpect(name: Identifier): boolean;
   isTestCall(node: CallExpression): boolean;
   isDefineConfig(name: string, position: number): boolean;
   boundExpression(expression: Expression): Expression | undefined;
@@ -118,11 +120,12 @@ type Binding =
   | { kind: "import"; defineConfig?: true }
   | { kind: "imported-request" }
   | { kind: "test" }
+  | { kind: "expect" }
   | { kind: "fixture" }
   | { kind: "other" }
   | AssignedBinding;
 
-type ImportKind = "import" | "imported-request" | "test";
+type ImportKind = "import" | "imported-request" | "test" | "expect";
 
 export function createConstantResolver(source: SourceFile): ConstantResolver {
   const root = createScope(undefined, source, source, true);
@@ -138,6 +141,16 @@ export function createConstantResolver(source: SourceFile): ConstantResolver {
     },
     bindingKind(name, position) {
       return lookup(scopeAt(root, position), name)?.kind;
+    },
+    assignment(name, position) {
+      const binding = lookup(scopeAt(root, position), name);
+      if (!binding || (binding.kind !== "value" && binding.kind !== "context")) return undefined;
+      if (binding.expression) return { assignments: binding.assignments, expression: binding.expression };
+      return { assignments: binding.assignments };
+    },
+    isExpect(name) {
+      const kind = lookup(scopeAt(root, name.getStart(source)), name.text)?.kind;
+      return kind === "expect" || (kind === undefined && name.text === "expect");
     },
     isTestCall(node) {
       return isPlaywrightTestCall(root, source, node);
@@ -398,6 +411,7 @@ class Collector {
       const kind: ImportKind =
         fromPlaywright && imported === "request" ? "imported-request"
         : fromPlaywright && imported === "test" ? "test"
+        : fromPlaywright && imported === "expect" ? "expect"
         : "import";
       this.bindImportName(element.name.text, kind, defineConfig);
     }
@@ -747,9 +761,7 @@ function readIdentifier(
 ): ResolveResult {
   const binding = lookup(scopeAt(root, node.getStart(source)), node.text);
   if (!binding) return { ok: false, reason: fallback };
-  if (binding.kind === "import" || binding.kind === "imported-request" || binding.kind === "test") {
-    return { ok: false, reason: "imported-value" };
-  }
+  if (isImportedBinding(binding.kind)) return { ok: false, reason: "imported-value" };
   if (binding.kind !== "value" && binding.kind !== "context") return { ok: false, reason: fallback };
   if (binding.assignments !== 1 || binding.expression === undefined) {
     return { ok: false, reason: binding.assignments > 1 ? "ambiguous-constant" : fallback };
@@ -823,7 +835,11 @@ function importedChain(source: SourceFile, root: Scope, expression: Expression):
   }
   if (!isIdentifier(current)) return false;
   const kind = lookup(scopeAt(root, current.getStart(source)), current.text)?.kind;
-  return kind === "import" || kind === "imported-request" || kind === "test";
+  return isImportedBinding(kind);
+}
+
+function isImportedBinding(kind: BindingKind | undefined): boolean {
+  return kind === "import" || kind === "imported-request" || kind === "test" || kind === "expect";
 }
 
 function createScope(parent: Scope | undefined, node: Node, source: SourceFile, functionScoped: boolean): Scope {

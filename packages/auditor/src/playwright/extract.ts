@@ -25,6 +25,7 @@ import {
   type ConstantResolver,
   type ResolveResult,
 } from "./constants.js";
+import { attachStatusExpectations } from "./expectations.js";
 import type { ExtractedCall, JsonValue, Literal } from "./model.js";
 import { withSourceFile } from "./parse.js";
 import { queryFromString, splitUrl, takeDynamicPath } from "./url.js";
@@ -58,6 +59,8 @@ class Extractor {
   private insideTest = 0;
   private pending: UnresolvedCall[] = [];
   private readonly calls: ExtractedCall[] = [];
+  private readonly responseCalls: Array<{ node: CallExpression; call: ExtractedCall }> = [];
+  private readonly callsInsideTest: CallExpression[] = [];
 
   constructor(
     private readonly file: string,
@@ -68,6 +71,7 @@ class Extractor {
 
   extract(): ExtractedCall[] {
     this.walk(this.source);
+    attachStatusExpectations(this.source, this.constants, this.responseCalls, this.callsInsideTest);
     return this.calls;
   }
 
@@ -77,7 +81,11 @@ class Extractor {
         this.walkTest(node);
         return;
       }
-      this.recordRequest(node);
+      const call = this.recordRequest(node);
+      if (this.insideTest > 0) {
+        if (call) this.responseCalls.push({ node, call });
+        this.callsInsideTest.push(node);
+      }
     } else if (isFunctionLikeDeclaration(node)) {
       if (node.body) this.walk(node.body);
       return;
@@ -100,15 +108,17 @@ class Extractor {
     this.insideTest -= 1;
   }
 
-  private recordRequest(node: CallExpression): void {
+  private recordRequest(node: CallExpression): ExtractedCall | undefined {
     const callee = node.expression;
-    if (!isPropertyAccessExpression(callee) || !isIdentifier(callee.expression)) return;
+    if (!isPropertyAccessExpression(callee) || !isIdentifier(callee.expression)) return undefined;
     const methodName = callee.name.text;
-    if (!isRequestMethod(methodName)) return;
+    if (!isRequestMethod(methodName)) return undefined;
     const receiver = callee.expression;
     const kind = this.constants.bindingKind(receiver.text, receiver.getStart(this.source));
-    if (kind !== "fixture" && kind !== "context") return;
-    this.calls.push(this.readCall(node, receiver.text, methodName));
+    if (kind !== "fixture" && kind !== "context") return undefined;
+    const call = this.readCall(node, receiver.text, methodName);
+    this.calls.push(call);
+    return call;
   }
 
   private readCall(node: CallExpression, receiver: string, methodName: string): ExtractedCall {
