@@ -1,7 +1,8 @@
-import { realpath, readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import SwaggerParser from "@apidevtools/swagger-parser";
+import { load } from "js-yaml";
 import type { OpenAPIV3, OpenAPIV3_1 } from "openapi-types";
 import { AuditorError } from "../errors.js";
 
@@ -17,26 +18,12 @@ interface RefFile {
   reference?: string;
 }
 
-/**
- * `SwaggerParser.parse` accepts Swagger 2.0 and rejects other non-OpenAPI
- * documents with its own wording. The parent parse returns the document so
- * Auditor can apply the OpenAPI 3.x check first.
- */
-type UntypedParse = (
-  this: SwaggerParser,
-  schema: string,
-  parserOptions: SwaggerParser.Options,
-) => Promise<unknown>;
-
 export async function parseSpec(
   specPath: string,
   options: ParseSpecOptions = {},
 ): Promise<OpenApiDocument> {
   const absolute = await resolveSpecPath(specPath);
-  const specDir = path.dirname(absolute);
-  const parserOptions = createParserOptions(specDir, options);
-  const parsed = await parseDocument(absolute, parserOptions);
-
+  const parsed = parseYaml(await readFile(absolute, "utf8"));
   if (!isOpenApi3(parsed)) {
     throw new AuditorError(
       `Expected OpenAPI 3.x, found ${versionFound(parsed)}`,
@@ -45,19 +32,13 @@ export async function parseSpec(
   }
 
   try {
-    const dereferenced = await SwaggerParser.validate(absolute, parserOptions);
-    if (!isOpenApi3(dereferenced)) {
-      throw new AuditorError(
-        `Expected OpenAPI 3.x, found ${versionFound(dereferenced)}`,
-        "SPEC_INVALID",
-      );
-    }
-    return dereferenced;
+    return (await SwaggerParser.validate(
+      absolute,
+      parsed,
+      resolverOptions(path.dirname(absolute), options),
+    )) as OpenApiDocument;
   } catch (error) {
-    if (error instanceof AuditorError) {
-      throw error;
-    }
-    throw asSpecError(error) ?? invalidOpenApi(error);
+    throw parserError(error);
   }
 }
 
@@ -72,27 +53,16 @@ async function resolveSpecPath(specPath: string): Promise<string> {
   }
 }
 
-async function parseDocument(
-  absolute: string,
-  parserOptions: SwaggerParser.Options,
-): Promise<unknown> {
-  const parse = (Object.getPrototypeOf(SwaggerParser.prototype) as { parse?: UntypedParse })
-    .parse;
-  if (typeof parse !== "function") {
-    throw new Error("OpenAPI parser is missing parse");
-  }
-
+function parseYaml(text: string): unknown {
   try {
-    return await parse.call(new SwaggerParser(), absolute, parserOptions);
+    return load(text);
   } catch (error) {
-    throw asSpecError(error) ?? error;
+    const message = error instanceof Error ? error.message : "unknown error";
+    throw new AuditorError(`Spec is not valid YAML or JSON: ${message}`, "SPEC_INVALID");
   }
 }
 
-function createParserOptions(
-  specDir: string,
-  options: ParseSpecOptions,
-): SwaggerParser.Options {
+function resolverOptions(specDir: string, options: ParseSpecOptions): SwaggerParser.Options {
   return {
     parse: {
       text: false,
@@ -114,10 +84,7 @@ function createParserOptions(
 }
 
 function isLocalRef(file: RefFile): boolean {
-  if (file.url.startsWith("file://")) {
-    return true;
-  }
-  return !/^[a-z][a-z0-9+.-]*:/i.test(file.url);
+  return file.url.startsWith("file://") || !/^[a-z][a-z0-9+.-]*:/i.test(file.url);
 }
 
 function isHttpRef(file: RefFile): boolean {
@@ -135,10 +102,7 @@ async function readContainedFile(specDir: string, file: RefFile): Promise<Buffer
   return readFile(candidate);
 }
 
-async function readAllowlistedUrl(
-  options: ParseSpecOptions,
-  file: RefFile,
-): Promise<Buffer> {
+async function readAllowlistedUrl(options: ParseSpecOptions, file: RefFile): Promise<Buffer> {
   const ref = refLabel(file);
   let hostname: string;
   try {
@@ -146,7 +110,6 @@ async function readAllowlistedUrl(
   } catch {
     throw new AuditorError(`External $ref ${ref} is not allowlisted`, "SPEC_INVALID");
   }
-
   if (!isHostAllowed(hostname, options.allowHosts)) {
     throw new AuditorError(`External $ref ${ref} is not allowlisted`, "SPEC_INVALID");
   }
@@ -155,7 +118,6 @@ async function readAllowlistedUrl(
   if (options.specAuthHeader !== undefined) {
     headers.set("Authorization", options.specAuthHeader);
   }
-
   const response = await fetch(file.url, { headers, redirect: "manual" });
   if (!response.ok) {
     await response.body?.cancel().catch(() => undefined);
@@ -168,24 +130,19 @@ async function readAllowlistedUrl(
 }
 
 function refLabel(file: RefFile): string {
-  if (typeof file.reference === "string" && file.reference.length > 0) {
-    return file.reference;
-  }
-  return file.url;
+  return typeof file.reference === "string" && file.reference.length > 0
+    ? file.reference
+    : file.url;
 }
 
 function toFilePath(fileUrl: string): string {
-  if (fileUrl.startsWith("file://")) {
-    return fileURLToPath(fileUrl);
-  }
-  return fileUrl;
+  return fileUrl.startsWith("file://") ? fileURLToPath(fileUrl) : fileUrl;
 }
 
 async function nearestRealPath(target: string): Promise<string> {
   const absolute = path.resolve(target);
   const missing: string[] = [];
   let current = absolute;
-
   for (;;) {
     try {
       const real = await realpath(current);
@@ -208,16 +165,11 @@ function isInside(root: string, target: string): boolean {
   const relative = path.relative(root, target);
   return (
     relative === "" ||
-    (relative !== ".." &&
-      !relative.startsWith(`..${path.sep}`) &&
-      !path.isAbsolute(relative))
+    (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
   );
 }
 
-function isHostAllowed(
-  hostname: string,
-  allowHosts: readonly string[] | undefined,
-): boolean {
+function isHostAllowed(hostname: string, allowHosts: readonly string[] | undefined): boolean {
   const host = hostname.toLowerCase();
   return (allowHosts ?? []).some((entry) => hostEntry(entry) === host);
 }
@@ -258,31 +210,24 @@ function formatVersion(value: unknown): string {
   if (typeof value === "string") {
     return value;
   }
-  if (value === undefined) {
-    return "undefined";
-  }
-  return String(value);
+  return value === undefined ? "undefined" : String(value);
 }
 
-function asSpecError(error: unknown): AuditorError | undefined {
-  const auditor = findAuditorError(error);
-  if (auditor) {
-    return auditor;
+function parserError(error: unknown): AuditorError {
+  const seen = new Set<unknown>();
+  let unmatched: Error | undefined;
+  let current: unknown = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    if (current instanceof AuditorError) {
+      return current;
+    }
+    if (!unmatched && isUnmatchedResolver(current)) {
+      unmatched = current;
+    }
+    const record = current as { cause?: unknown; error?: unknown };
+    current = record.cause ?? record.error;
   }
-  const syntax = findNamedError(error, ["ParserError", "UnmatchedParserError"], [
-    "EPARSER",
-    "EUNMATCHEDPARSER",
-  ]);
-  if (syntax) {
-    return new AuditorError(
-      `Spec is not valid YAML or JSON: ${syntax.message}`,
-      "SPEC_INVALID",
-    );
-  }
-  if (findMessage(error, "is not a valid JSON Schema")) {
-    return new AuditorError("Expected OpenAPI 3.x, found undefined", "SPEC_INVALID");
-  }
-  const unmatched = findNamedError(error, ["UnmatchedResolverError"], ["EUNMATCHEDRESOLVER"]);
   if (unmatched) {
     const source =
       "source" in unmatched && typeof unmatched.source === "string"
@@ -290,90 +235,31 @@ function asSpecError(error: unknown): AuditorError | undefined {
         : unmatched.message;
     return new AuditorError(`External $ref ${source} is not allowlisted`, "SPEC_INVALID");
   }
-  return undefined;
-}
-
-function invalidOpenApi(error: unknown): AuditorError {
   return new AuditorError(`Invalid OpenAPI: ${firstErrorText(error)}`, "SPEC_INVALID");
 }
 
+function isUnmatchedResolver(error: object): error is Error {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const code = "code" in error ? error.code : undefined;
+  return error.name === "UnmatchedResolverError" || code === "EUNMATCHEDRESOLVER";
+}
+
 function firstErrorText(error: unknown): string {
-  if (error instanceof Error) {
-    const details = (error as { details?: unknown }).details;
-    if (Array.isArray(details)) {
-      const first: unknown = details[0];
-      if (isRecord(first) && typeof first.message === "string") {
-        const instancePath =
-          typeof first.instancePath === "string" && first.instancePath.length > 0
-            ? first.instancePath
-            : "/";
-        return `${instancePath} ${first.message}`;
-      }
-    }
-    const line = error.message
-      .split("\n")
-      .map((part) => part.trim())
-      .find((part) => part.length > 0);
-    return line ?? "unknown error";
+  if (!(error instanceof Error)) {
+    return "unknown error";
   }
-  return "unknown error";
-}
-
-function findAuditorError(error: unknown): AuditorError | undefined {
-  let found: AuditorError | undefined;
-  walkErrors(error, (current) => {
-    if (current instanceof AuditorError) {
-      found = current;
-      return true;
-    }
-    return false;
-  });
-  return found;
-}
-
-function findNamedError(
-  error: unknown,
-  names: readonly string[],
-  codes: readonly string[],
-): (Error & { source?: unknown }) | undefined {
-  let found: (Error & { source?: unknown }) | undefined;
-  walkErrors(error, (current) => {
-    if (!(current instanceof Error)) {
-      return false;
-    }
-    const code = "code" in current ? current.code : undefined;
-    if (names.includes(current.name) || (typeof code === "string" && codes.includes(code))) {
-      found = current;
-      return true;
-    }
-    return false;
-  });
-  return found;
-}
-
-function findMessage(error: unknown, fragment: string): boolean {
-  let found = false;
-  walkErrors(error, (current) => {
-    if (current instanceof Error && current.message.includes(fragment)) {
-      found = true;
-      return true;
-    }
-    return false;
-  });
-  return found;
-}
-
-function walkErrors(error: unknown, visit: (current: object) => boolean): void {
-  const seen = new Set<unknown>();
-  let current: unknown = error;
-  while (current && typeof current === "object" && !seen.has(current)) {
-    seen.add(current);
-    if (visit(current)) {
-      return;
-    }
-    const record = current as { cause?: unknown; error?: unknown };
-    current = record.cause ?? record.error;
+  const details = (error as { details?: unknown }).details;
+  const first = Array.isArray(details) ? details[0] : undefined;
+  if (isRecord(first) && typeof first.message === "string") {
+    const instancePath =
+      typeof first.instancePath === "string" && first.instancePath.length > 0
+        ? first.instancePath
+        : "/";
+    return `${instancePath} ${first.message}`;
   }
+  return error.message.split("\n").find((line) => line.trim().length > 0)?.trim() ?? "unknown error";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
