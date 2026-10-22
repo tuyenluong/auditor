@@ -1,5 +1,15 @@
+import type { OpenAPIV3, OpenAPIV3_1 } from "openapi-types";
 import { AuditorError } from "../errors.js";
 import type { OpenApiDocument } from "./parse.js";
+
+type SchemaObject = OpenAPIV3.SchemaObject | OpenAPIV3_1.SchemaObject;
+type ReferenceObject = OpenAPIV3.ReferenceObject | OpenAPIV3_1.ReferenceObject;
+type ParameterObject = OpenAPIV3.ParameterObject;
+type RequestBodyObject = OpenAPIV3.RequestBodyObject | OpenAPIV3_1.RequestBodyObject;
+type ResponseObject = OpenAPIV3.ResponseObject | OpenAPIV3_1.ResponseObject;
+type OperationObject = OpenAPIV3.OperationObject | OpenAPIV3_1.OperationObject;
+type PathItemObject = OpenAPIV3.PathItemObject | OpenAPIV3_1.PathItemObject;
+type MediaTypeObject = OpenAPIV3.MediaTypeObject | OpenAPIV3_1.MediaTypeObject;
 
 export type HttpMethod =
   | "get"
@@ -65,51 +75,33 @@ const HTTP_METHODS = [
   "trace",
 ] as const satisfies readonly HttpMethod[];
 
-const PARAMETER_LOCATIONS = ["path", "query", "header", "cookie"] as const;
-
 const SCHEMA_TYPE_ORDER = ["string", "number", "integer", "boolean", "object", "array", "null"];
 
 export function toSpecModel(
   doc: OpenApiDocument,
   source: { source: SpecModel["source"]; location: string },
 ): SpecModel {
-  const record = asRecord(doc, "document");
-  if (typeof record.openapi !== "string") {
-    throw new AuditorError("Invalid OpenAPI: missing openapi version", "SPEC_INVALID");
-  }
-
-  const model: SpecModel = {
-    openapi: record.openapi,
+  return {
+    openapi: doc.openapi,
+    title: doc.info.title,
+    version: doc.info.version,
     source: source.source,
     location: source.location,
-    operations: mapOperations(record.paths),
-    servers: mapServers(record.servers),
+    operations: mapOperations("paths" in doc ? doc.paths : undefined),
+    servers: mapServers(doc.servers),
   };
-  const info = isRecord(record.info) ? record.info : undefined;
-  if (info !== undefined && typeof info.title === "string") model.title = info.title;
-  if (info !== undefined && typeof info.version === "string") model.version = info.version;
-  return model;
 }
 
-function mapOperations(paths: unknown): SpecOperation[] {
-  if (paths === undefined) return [];
-  const record = asRecord(paths, "paths");
+function mapOperations(paths: OpenApiDocument["paths"]): SpecOperation[] {
   const operations: SpecOperation[] = [];
-  for (const [pathTemplate, pathItem] of Object.entries(record)) {
+  for (const [pathTemplate, pathItem] of Object.entries(paths ?? {})) {
     if (pathItem === undefined) continue;
-    const item = asRecord(pathItem, `path ${pathTemplate}`);
+    const item = deref<PathItemObject>(pathItem);
     const pathParameters = mapParameterList(item.parameters);
     for (const method of HTTP_METHODS) {
       const operation = item[method];
       if (operation === undefined) continue;
-      operations.push(
-        mapOperation(
-          method,
-          pathTemplate,
-          pathParameters,
-          asRecord(operation, `${method.toUpperCase()} ${pathTemplate}`),
-        ),
-      );
+      operations.push(mapOperation(method, pathTemplate, pathParameters, operation));
     }
   }
   return operations;
@@ -119,7 +111,7 @@ function mapOperation(
   method: HttpMethod,
   pathTemplate: string,
   pathParameters: readonly SpecParameter[],
-  operation: Record<string, unknown>,
+  operation: OperationObject,
 ): SpecOperation {
   const mapped: SpecOperation = {
     method,
@@ -127,8 +119,10 @@ function mapOperation(
     parameters: mergeParameters(pathParameters, mapParameterList(operation.parameters)),
     responses: mapResponses(operation.responses),
   };
-  if (typeof operation.operationId === "string") mapped.operationId = operation.operationId;
-  if (operation.requestBody !== undefined) mapped.requestBody = mapRequestBody(operation.requestBody);
+  if (operation.operationId !== undefined) mapped.operationId = operation.operationId;
+  if (operation.requestBody !== undefined) {
+    mapped.requestBody = mapRequestBody(deref(operation.requestBody));
+  }
   return mapped;
 }
 
@@ -145,94 +139,89 @@ function mergeParameters(
   return merged;
 }
 
-function mapParameterList(value: unknown): SpecParameter[] {
-  if (value === undefined) return [];
-  if (!Array.isArray(value)) {
-    throw new AuditorError("Invalid OpenAPI: parameters are not an array", "SPEC_INVALID");
-  }
-  return value.map((parameter) => mapParameter(parameter));
+function mapParameterList(parameters: ReadonlyArray<ReferenceObject | ParameterObject> | undefined): SpecParameter[] {
+  if (parameters === undefined) return [];
+  return parameters.map((parameter) => mapParameter(deref(parameter)));
 }
 
-function mapParameter(value: unknown): SpecParameter {
-  const record = asRecord(value, "parameter");
-  if (typeof record.name !== "string" || typeof record.in !== "string" || !isParameterLocation(record.in)) {
-    throw new AuditorError("Invalid OpenAPI: parameter is missing name or in", "SPEC_INVALID");
-  }
-  const parameter: SpecParameter = {
-    name: record.name,
-    in: record.in,
+function mapParameter(parameter: ParameterObject): SpecParameter {
+  const mapped: SpecParameter = {
+    name: parameter.name,
+    in: parameter.in as SpecParameter["in"],
     // OpenAPI path parameters are required.
-    required: record.in === "path" || record.required === true,
+    required: parameter.in === "path" || parameter.required === true,
   };
-  if (record.schema !== undefined) parameter.schema = mapSchema(record.schema);
-  return parameter;
+  if (parameter.schema !== undefined) mapped.schema = mapSchema(deref(parameter.schema));
+  return mapped;
 }
 
-function isParameterLocation(value: string): value is SpecParameter["in"] {
-  return (PARAMETER_LOCATIONS as readonly string[]).includes(value);
-}
-
-function mapRequestBody(value: unknown): NonNullable<SpecOperation["requestBody"]> {
-  const record = asRecord(value, "request body");
+function mapRequestBody(body: RequestBodyObject): NonNullable<SpecOperation["requestBody"]> {
   return {
-    required: record.required === true,
-    content: mapContent(record.content),
+    required: body.required === true,
+    content: mapContent(body.content),
   };
 }
 
-function mapResponses(value: unknown): SpecOperation["responses"] {
-  if (value === undefined) return {};
-  const record = asRecord(value, "responses");
-  const responses: SpecOperation["responses"] = {};
-  for (const [status, response] of Object.entries(record)) {
-    const body = asRecord(response, `response ${status}`);
-    responses[status] = { content: mapContent(body.content) };
+function mapResponses(
+  responses: OpenAPIV3.ResponsesObject | OpenAPIV3_1.ResponsesObject | undefined,
+): SpecOperation["responses"] {
+  const mapped: SpecOperation["responses"] = {};
+  if (responses === undefined) return mapped;
+  for (const [status, response] of Object.entries(responses)) {
+    if (response === undefined) continue;
+    mapped[status] = { content: mapContent(deref<ResponseObject>(response).content) };
   }
-  return responses;
+  return mapped;
 }
 
-function mapContent(value: unknown): Record<string, JsonSchema> {
-  if (value === undefined) return {};
-  const record = asRecord(value, "content");
-  const content: Record<string, JsonSchema> = {};
-  for (const [mediaType, entry] of Object.entries(record)) {
-    const media = asRecord(entry, `content ${mediaType}`);
-    content[mediaType] = media.schema === undefined ? {} : mapSchema(media.schema);
+function mapContent(content: Readonly<Record<string, MediaTypeObject>> | undefined): Record<string, JsonSchema> {
+  if (content === undefined) return {};
+  const mapped: Record<string, JsonSchema> = {};
+  for (const [mediaType, entry] of Object.entries(content)) {
+    mapped[mediaType] = entry.schema === undefined ? {} : mapSchema(deref(entry.schema));
   }
-  return content;
+  return mapped;
 }
 
-function mapSchema(value: unknown): JsonSchema {
-  const record = asRecord(value, "schema");
-  const mapped = mapSchemaFields(record);
-  if (record.allOf === undefined) return mapped;
-  if (!Array.isArray(record.allOf)) {
-    throw new AuditorError("Invalid OpenAPI: allOf is not an array", "SPEC_INVALID");
-  }
-  return record.allOf.reduce(
-    (schema: JsonSchema, member: unknown) => mergeSchemas(schema, mapSchema(member)),
+function mapSchema(schema: SchemaObject): JsonSchema {
+  const mapped = mapSchemaFields(schema);
+  if (schema.allOf === undefined) return mapped;
+  return schema.allOf.reduce(
+    (current, member) => mergeSchemas(current, mapSchema(deref(member))),
     mapped,
   );
 }
 
-function mapSchemaFields(schema: Record<string, unknown>): JsonSchema {
+function mapSchemaFields(schema: SchemaObject): JsonSchema {
   const mapped: JsonSchema = {};
-  if (schema.type !== undefined) mapped.type = readType(schema.type);
-  if (schema.enum !== undefined) mapped.enum = readEnum(schema.enum);
-  if (schema.properties !== undefined) mapped.properties = readProperties(schema.properties);
-  if (schema.required !== undefined) mapped.required = readStringArray(schema.required, "required");
-  if (schema.items !== undefined) mapped.items = mapSchema(schema.items);
+  if (schema.type !== undefined) mapped.type = schema.type;
+  if (schema.enum !== undefined) mapped.enum = [...schema.enum];
+  if (schema.properties !== undefined) mapped.properties = mapProperties(schema.properties);
+  if (schema.required !== undefined) mapped.required = [...schema.required];
+  if ("items" in schema && schema.items !== undefined) mapped.items = mapSchema(deref(schema.items));
   if (schema.additionalProperties !== undefined) {
     mapped.additionalProperties =
       typeof schema.additionalProperties === "boolean"
         ? schema.additionalProperties
-        : mapSchema(schema.additionalProperties);
+        : mapSchema(deref(schema.additionalProperties));
   }
-  if (schema.oneOf !== undefined) mapped.oneOf = readSchemaArray(schema.oneOf, "oneOf");
-  if (schema.anyOf !== undefined) mapped.anyOf = readSchemaArray(schema.anyOf, "anyOf");
-  if (schema.nullable !== undefined) mapped.nullable = readBoolean(schema.nullable, "nullable");
-  if (schema.format !== undefined) mapped.format = readString(schema.format, "format");
+  if (schema.oneOf !== undefined) mapped.oneOf = schema.oneOf.map((entry) => mapSchema(deref(entry)));
+  if (schema.anyOf !== undefined) mapped.anyOf = schema.anyOf.map((entry) => mapSchema(deref(entry)));
+  if ("nullable" in schema && schema.nullable !== undefined) mapped.nullable = schema.nullable;
+  if (schema.format !== undefined) mapped.format = schema.format;
   return mapped;
+}
+
+function mapProperties(properties: Readonly<Record<string, ReferenceObject | SchemaObject>>): Record<string, JsonSchema> {
+  const mapped: Record<string, JsonSchema> = {};
+  for (const [name, property] of Object.entries(properties)) {
+    mapped[name] = mapSchema(deref(property));
+  }
+  return mapped;
+}
+
+function deref<T>(value: T | ReferenceObject): T {
+  return value as T;
 }
 
 function mergeSchemas(left: JsonSchema, right: JsonSchema): JsonSchema {
@@ -380,92 +369,10 @@ function mergeFormat(left?: string, right?: string): string | undefined {
   throw new AuditorError(`Conflicting allOf format: ${left} and ${right}`, "SPEC_INVALID");
 }
 
-function mapServers(value: unknown): string[] {
-  if (value === undefined) return [];
-  if (!Array.isArray(value)) {
-    throw new AuditorError("Invalid OpenAPI: servers are not an array", "SPEC_INVALID");
-  }
+function mapServers(servers: OpenApiDocument["servers"]): string[] {
   const urls: string[] = [];
-  for (const server of value) {
-    if (isRecord(server) && typeof server.url === "string") urls.push(server.url);
+  for (const server of servers ?? []) {
+    if (typeof server.url === "string") urls.push(server.url);
   }
   return urls;
-}
-
-function readType(value: unknown): string | string[] {
-  if (typeof value === "string") return value;
-  if (!Array.isArray(value) || value.length === 0) {
-    throw new AuditorError("Invalid OpenAPI: schema type is not a string", "SPEC_INVALID");
-  }
-  const types: string[] = [];
-  for (const item of value) {
-    if (typeof item !== "string") {
-      throw new AuditorError("Invalid OpenAPI: schema type is not a string", "SPEC_INVALID");
-    }
-    types.push(item);
-  }
-  const [only] = types;
-  return types.length === 1 && only !== undefined ? only : types;
-}
-
-function readEnum(value: unknown): unknown[] {
-  if (!Array.isArray(value)) {
-    throw new AuditorError("Invalid OpenAPI: enum is not an array", "SPEC_INVALID");
-  }
-  return [...value];
-}
-
-function readProperties(value: unknown): Record<string, JsonSchema> {
-  const record = asRecord(value, "properties");
-  const properties: Record<string, JsonSchema> = {};
-  for (const [name, property] of Object.entries(record)) {
-    properties[name] = mapSchema(property);
-  }
-  return properties;
-}
-
-function readStringArray(value: unknown, keyword: string): string[] {
-  if (!Array.isArray(value)) {
-    throw new AuditorError(`Invalid OpenAPI: ${keyword} must be an array of strings`, "SPEC_INVALID");
-  }
-  const names: string[] = [];
-  for (const item of value) {
-    if (typeof item !== "string") {
-      throw new AuditorError(`Invalid OpenAPI: ${keyword} must be an array of strings`, "SPEC_INVALID");
-    }
-    if (!names.includes(item)) names.push(item);
-  }
-  return names;
-}
-
-function readSchemaArray(value: unknown, keyword: string): JsonSchema[] {
-  if (!Array.isArray(value)) {
-    throw new AuditorError(`Invalid OpenAPI: ${keyword} is not an array`, "SPEC_INVALID");
-  }
-  return value.map((entry) => mapSchema(entry));
-}
-
-function readBoolean(value: unknown, keyword: string): boolean {
-  if (typeof value !== "boolean") {
-    throw new AuditorError(`Invalid OpenAPI: ${keyword} is not a boolean`, "SPEC_INVALID");
-  }
-  return value;
-}
-
-function readString(value: unknown, keyword: string): string {
-  if (typeof value !== "string") {
-    throw new AuditorError(`Invalid OpenAPI: ${keyword} is not a string`, "SPEC_INVALID");
-  }
-  return value;
-}
-
-function asRecord(value: unknown, label: string): Record<string, unknown> {
-  if (!isRecord(value)) {
-    throw new AuditorError(`Invalid OpenAPI: ${label} is not an object`, "SPEC_INVALID");
-  }
-  return value;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
