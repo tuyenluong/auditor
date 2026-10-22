@@ -461,7 +461,7 @@ class Extractor {
         this.push(located, callee, existing.unresolved);
         continue;
       }
-      if (!Object.is(existing, value)) {
+      if (String(existing) !== String(value)) {
         query[key] = { unresolved: "ambiguous-constant" };
         this.push(located, callee, "ambiguous-constant");
       }

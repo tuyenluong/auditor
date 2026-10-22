@@ -302,8 +302,16 @@ it("reads a params query string and URLSearchParams", () => {
   expect(found.map((call) => call.query)).toEqual([{ limit: "1", foo: "2" }, { limit: "1" }]);
 });
 
+it("treats a numeric param as the same query value as its string form", () => {
+  const text = "test('a', async ({ request }) => { await request.get('/orders?limit=1', { params: { limit: 1 } }) })";
+  const call = extractCalls({ path: "orders.spec.ts", text })[0];
+
+  expect(call?.query).toEqual({ limit: "1" });
+  expect(call?.unresolved).toEqual([]);
+});
+
 it("records a query key that disagrees with params", () => {
-  const text = "test('a', async ({ request }) => { await request.get('/orders?limit=2', { params: { limit: 1 } }) })";
+  const text = "test('a', async ({ request }) => { await request.get('/orders?limit=1', { params: { limit: 2 } }) })";
   const call = extractCalls({ path: "orders.spec.ts", text })[0];
 
   expect(call?.path).toBe("/orders");
