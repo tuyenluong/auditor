@@ -1,5 +1,3 @@
-import { extname } from "node:path";
-import { API } from "typescript/unstable/sync";
 import {
   isCallExpression,
   isFunctionLikeDeclaration,
@@ -28,8 +26,8 @@ import {
   type ResolveResult,
 } from "./constants.js";
 import type { ExtractedCall, JsonValue, Literal } from "./model.js";
-
-const SUPPORTED_EXTENSIONS = new Set([".ts", ".mts", ".cts", ".js", ".mjs", ".cjs"]);
+import { withSourceFile } from "./parse.js";
+import { queryFromString, splitUrl } from "./url.js";
 
 const HTTP_METHODS = new Set<HttpMethod>([
   "get",
@@ -51,53 +49,8 @@ type ParamRead =
 
 type Located = { line: number; column: number };
 
-const files = new Map<string, string>();
-let parser: API | undefined;
-let sequence = 0;
-
 export function extractCalls(file: { path: string; text: string }): ExtractedCall[] {
-  const extension = extname(file.path).toLowerCase();
-  if (!SUPPORTED_EXTENSIONS.has(extension)) return [];
-  return parseCalls(file.path, extension, file.text);
-}
-
-function parseCalls(filePath: string, extension: string, text: string): ExtractedCall[] {
-  const api = parserApi();
-  sequence += 1;
-  const virtualPath = `/virtual/file-${sequence}${extension}`;
-  files.set(virtualPath, text);
-  try {
-    const snapshot = api.updateSnapshot({ openFiles: [virtualPath] });
-    try {
-      const source = snapshot.getDefaultProjectForFile(virtualPath)?.program.getSourceFile(virtualPath);
-      if (!source) return [];
-      return new Extractor(filePath, source).extract();
-    } finally {
-      snapshot.dispose();
-    }
-  } finally {
-    files.delete(virtualPath);
-    api.updateSnapshot({ closeFiles: [virtualPath] });
-  }
-}
-
-function parserApi(): API {
-  parser ??= new API({
-    cwd: "/",
-    fs: {
-      readFile(name) {
-        const text = files.get(name);
-        return text === undefined ? null : text;
-      },
-      fileExists(name) {
-        return files.has(name);
-      },
-      directoryExists(name) {
-        return !files.has(name);
-      },
-    },
-  });
-  return parser;
+  return withSourceFile(file.path, file.text, (source) => new Extractor(file.path, source).extract()) ?? [];
 }
 
 class Extractor {
@@ -449,19 +402,5 @@ function entriesFromRecord(value: { [key: string]: JsonValue }, fallback: Unreso
   for (const [key, item] of Object.entries(value)) {
     entries[key] = item === null || typeof item !== "object" ? item : { unresolved: fallback };
   }
-  return entries;
-}
-
-function splitUrl(url: string): { path: string; query: Record<string, string> } {
-  const hash = url.indexOf("#");
-  const withoutHash = hash === -1 ? url : url.slice(0, hash);
-  const question = withoutHash.indexOf("?");
-  if (question === -1) return { path: withoutHash, query: {} };
-  return { path: withoutHash.slice(0, question), query: queryFromString(withoutHash.slice(question + 1)) };
-}
-
-function queryFromString(query: string): Record<string, string> {
-  const entries: Record<string, string> = {};
-  for (const [key, value] of new URLSearchParams(query)) entries[key] = value;
   return entries;
 }
